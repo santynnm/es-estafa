@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { extractTextFromImage } from "./_lib/vision.js";
 import { GeminiError, InvalidGeminiResponseError } from "./_lib/gemini.js";
+import { respondToGeminiError } from "./_lib/httpErrors.js";
 
 const ALLOWED_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MAX_DECODED_BYTES = 3 * 1024 * 1024; // 3 MB — margen respecto del límite de body de Vercel.
@@ -63,7 +64,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const rawText = (await extractTextFromImage(imageBase64, mimeType, apiKey)).trim();
 
     if (!rawText) {
-      res.status(422).json({ error: "No se detectó texto legible en la imagen." });
+      res.status(422).json({
+        error: "No se detectó texto legible en la imagen. Probá subir una captura más clara o con más contraste.",
+      });
       return;
     }
 
@@ -76,7 +79,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     if (err instanceof GeminiError) {
       console.error("Error al llamar a Gemini (visión):", err.message);
-      res.status(502).json({ error: "No se pudo procesar la imagen en este momento. Probá de nuevo en unos segundos." });
+      respondToGeminiError(res, err, "No se pudo procesar la imagen en este momento. Probá de nuevo en unos segundos.");
       return;
     }
     console.error("Error inesperado en /api/extract-image:", err);

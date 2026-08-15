@@ -19,7 +19,19 @@ const CLASSIFIER_RESPONSE_SCHEMA = {
   propertyOrdering: ["risk_level", "signals", "explanation", "recommended_action"],
 };
 
-export class GeminiError extends Error {}
+// Preserva el status HTTP devuelto por Gemini (en particular 429, límite del
+// tier gratuito) para que api/analyze.ts y api/extract-image.ts puedan
+// propagarlo al cliente en vez de convertir todo en un 502 genérico.
+export class GeminiError extends Error {
+  status?: number;
+  retryAfterSeconds?: number;
+
+  constructor(message: string, options?: { status?: number; retryAfterSeconds?: number }) {
+    super(message);
+    this.status = options?.status;
+    this.retryAfterSeconds = options?.retryAfterSeconds;
+  }
+}
 export class InvalidGeminiResponseError extends Error {}
 
 interface GenerateContentPart {
@@ -31,6 +43,28 @@ interface GenerateContentParams {
   model?: string;
   parts: GenerateContentPart[];
   generationConfig: Record<string, unknown>;
+}
+
+// Best-effort: Gemini puede indicar cuánto esperar vía el header Retry-After
+// o, en el body de error de un 429, vía google.rpc.RetryInfo.retryDelay
+// (ej: "20s"). Si no hay ninguno, devuelve undefined y el caller usa un
+// default razonable.
+function parseRetryAfterSeconds(response: Response, bodyText: string): number | undefined {
+  const header = response.headers.get("retry-after");
+  if (header && !Number.isNaN(Number(header))) {
+    return Number(header);
+  }
+  try {
+    const parsed = JSON.parse(bodyText) as {
+      error?: { details?: Array<{ ["@type"]?: string; retryDelay?: string }> };
+    };
+    const retryInfo = parsed.error?.details?.find((d) => d["@type"]?.includes("RetryInfo"));
+    const match = retryInfo?.retryDelay ? /^(\d+(?:\.\d+)?)s$/.exec(retryInfo.retryDelay) : null;
+    if (match) return Math.ceil(Number(match[1]));
+  } catch {
+    // best-effort, ignorar si el body no es el JSON esperado.
+  }
+  return undefined;
 }
 
 // Llamada de bajo nivel a generateContent, compartida por la clasificación de
@@ -67,7 +101,10 @@ async function generateContent(params: GenerateContentParams, apiKey: string): P
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new GeminiError(`Gemini respondió con error ${response.status}: ${body.slice(0, 500)}`);
+    throw new GeminiError(`Gemini respondió con error ${response.status}: ${body.slice(0, 500)}`, {
+      status: response.status,
+      retryAfterSeconds: parseRetryAfterSeconds(response, body),
+    });
   }
 
   const data = (await response.json()) as {

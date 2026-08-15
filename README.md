@@ -1,12 +1,13 @@
 # ¿Es estafa?
 
-MVP (Día 1) de una app web que ayuda a identificar si un mensaje, SMS, email o llamada
-descripta por texto es una estafa. El usuario pega el texto, se analiza con Google Gemini
-y se muestra un veredicto de riesgo (bajo/medio/alto) con señales, explicación y una
-acción recomendada. Ver `indicaciones.md` para la especificación completa del proyecto.
+MVP de una app web que ayuda a identificar si un mensaje, SMS, email o llamada es una
+estafa. El usuario pega el texto o sube una captura de pantalla, se analiza con Google
+Gemini y se muestra un veredicto de riesgo (bajo/medio/alto) con señales, explicación y
+una acción recomendada. Ver `indicaciones.md` para la especificación completa del
+proyecto.
 
-En esta etapa **no hay login ni persistencia**: es solo el flujo de análisis de texto
-funcionando de punta a punta.
+Por ahora **no hay login ni persistencia**: ni el texto ni las imágenes se guardan en
+ningún lado, se procesan solo para responder la petición en curso.
 
 ## Stack
 
@@ -108,8 +109,18 @@ Además del análisis de texto, hay un endpoint separado `api/extract-image.ts` 
 transcribe el texto visible de una captura de pantalla (imagen → `raw_text`, sin
 clasificar riesgo) usando la visión de Gemini. Ese texto extraído se manda después a
 `/api/analyze` con `source_type: "image_ocr"`, reutilizando el mismo clasificador
-calibrado del Día 2 — no hay un prompt de riesgo separado para imágenes. Todavía **no
-hay interfaz de subida** en el frontend; esta etapa es solo el pipeline backend.
+calibrado del Día 2 — no hay un prompt de riesgo separado para imágenes.
+
+Desde el Día 3-4B la interfaz tiene un selector **"Pegar un texto" / "Subir una
+captura"** (arranca en modo texto). En modo imagen: se elige un archivo PNG/JPEG/WebP de
+hasta 3 MB desde el selector estándar del dispositivo (incluye galería en mobile), se
+muestra nombre, tamaño y una preview, y se puede cambiar o quitar antes de analizar. Al
+tocar "Analizar" se ven dos estados de carga en secuencia — "Leyendo la captura..." y
+"Analizando..." — y el resultado se muestra en el mismo `ResultCard` que en modo texto.
+La imagen nunca se persiste ni se sube a otro lado más que a `/api/extract-image`; el
+base64 tampoco se loguea en ningún momento (ni consola del navegador, ni logs del
+servidor). Cambiar de modo limpia el resultado/error anterior y no dispara ninguna
+llamada automática.
 
 `/api/extract-image` recibe:
 
@@ -135,6 +146,15 @@ EVAL_BASE_URL=http://localhost:3000 npm run eval:image   # contra vercel dev en 
 Cubre: PNG válido, WebP válido, MIME inválido, base64 inválido, imagen > 3 MB, imagen sin
 texto legible, y el flujo de integración completo (imagen de estafa → extracción →
 `/api/analyze` con `image_ocr` → `risk_level: "alto"`).
+
+## Límite del tier gratuito de Gemini (429)
+
+El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`
+y `/api/extract-image` devuelven **HTTP 429** (con header `Retry-After` cuando Gemini lo informa) y
+la interfaz muestra: *"Se hicieron muchos análisis en poco tiempo. Esperá unos segundos y volvé a
+intentar."* No hay reintentos automáticos (consumirían más cuota) — el usuario reintenta
+manualmente cuando quiera. Por eso `npm run eval` y `npm run eval:image` no deben correrse repetidas
+veces dentro de la misma ventana de un minuto contra producción.
 
 ## Deploy (Vercel)
 

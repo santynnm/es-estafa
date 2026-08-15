@@ -6,6 +6,7 @@ import {
   SUPPORTED_SOURCE_TYPES,
 } from "../shared/classifierContract.js";
 import { callGemini, GeminiError, InvalidGeminiResponseError } from "./_lib/gemini.js";
+import { respondToGeminiError } from "./_lib/httpErrors.js";
 
 const MAX_RAW_TEXT_LENGTH = 6000;
 
@@ -69,7 +70,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     if (err instanceof GeminiError) {
       console.error("Error al llamar a Gemini:", err.message);
-      res.status(502).json({ error: "No se pudo analizar el texto en este momento. Probá de nuevo en unos segundos." });
+      respondToGeminiError(res, err, "No se pudo analizar el texto en este momento. Probá de nuevo en unos segundos.");
       return;
     }
     console.error("Error inesperado en /api/analyze:", err);
