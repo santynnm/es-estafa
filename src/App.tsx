@@ -38,6 +38,17 @@ function App() {
     setImageValidationError(null);
   }
 
+  // Centraliza el cambio de archivo (selección, cambio o "Quitar" -> null):
+  // el veredicto y el error general corresponden al archivo anterior, así
+  // que nunca deben seguir visibles una vez que ese archivo ya no es el
+  // seleccionado. `imageValidationError` se mantiene aparte porque lo
+  // administra ImageUpload para el archivo nuevo.
+  function handleImageFileChange(file: File | null) {
+    setImageFile(file);
+    setResult(null);
+    setError(null);
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (submittingRef.current) return;
@@ -159,7 +170,7 @@ function App() {
           ) : (
             <ImageUpload
               file={imageFile}
-              onFileChange={setImageFile}
+              onFileChange={handleImageFileChange}
               error={imageValidationError}
               onErrorChange={setImageValidationError}
               disabled={stage !== "idle"}
