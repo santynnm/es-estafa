@@ -37,7 +37,10 @@ npm install
 2. Generá una API key gratuita en [Google AI Studio](https://aistudio.google.com/apikey)
    y pegala en `.env` como `GEMINI_API_KEY`.
 
-   `GEMINI_MODEL` es opcional (por defecto usa `gemini-2.0-flash`).
+   `GEMINI_MODEL` es opcional (por defecto usa `gemini-3.5-flash-lite`). Google deprecia
+   modelos con el tiempo — si empieza a fallar con 404 "model ... is no longer
+   available", corré `node scripts/check-models.mjs TU_API_KEY` para ver qué modelos
+   responden OK.
 
 `.env` está en `.gitignore`: nunca se commitea.
 
@@ -78,6 +81,25 @@ Con `vercel dev` corriendo y `GEMINI_API_KEY` configurada, pegá un texto como:
 
 y tocá "Analizar". Deberías ver un resultado con nivel de riesgo, señales detectadas,
 una explicación simple y una acción recomendada.
+
+## Evaluar el clasificador (Día 2)
+
+Hay un conjunto de evaluación reproducible en `scripts/eval-classifier.mts` con los seis
+casos de la sección 10 de `indicaciones.md` (cinco de estafa + un control neutral) más
+tres casos de robustez: intento de inyección de instrucciones dentro del texto, un
+mensaje urgente pero legítimo (para chequear que no se marque como riesgo alto solo por
+tener urgencia), y texto vacío. Llama al endpoint real `/api/analyze` — no usa mocks.
+
+```bash
+npm run eval                                      # contra la producción (https://codercup.vercel.app)
+EVAL_BASE_URL=http://localhost:3000 npm run eval   # contra vercel dev en local
+```
+
+Por cada caso imprime el riesgo esperado vs. el obtenido, las señales detectadas y
+PASS/FAIL, y al final un resumen. Termina con exit code distinto de 0 si algún caso falla
+(sirve para CI). Correlo más de una vez si querés chequear consistencia entre corridas —
+el resultado de `risk_level` debería ser estable aunque la redacción de `signals`/
+`explanation` varíe levemente.
 
 ## Deploy (Vercel)
 

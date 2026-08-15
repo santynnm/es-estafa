@@ -3,6 +3,22 @@ import { buildPrompt } from "./prompt.js";
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const REQUEST_TIMEOUT_MS = 20_000;
 
+// Esquema enviado a Gemini para pedir salida JSON estructurada (mejora la
+// consistencia del modelo). Es un detalle interno de esta llamada, no el
+// contrato público — ese sigue siendo shared/classifierContract.ts, validado
+// igual en api/analyze.ts sin confiar ciegamente en que Gemini lo respete.
+const CLASSIFIER_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    risk_level: { type: "STRING", enum: ["bajo", "medio", "alto"] },
+    signals: { type: "ARRAY", items: { type: "STRING" } },
+    explanation: { type: "STRING" },
+    recommended_action: { type: "STRING" },
+  },
+  required: ["risk_level", "signals", "explanation", "recommended_action"],
+  propertyOrdering: ["risk_level", "signals", "explanation", "recommended_action"],
+};
+
 export class GeminiError extends Error {}
 export class InvalidGeminiResponseError extends Error {}
 
@@ -25,8 +41,9 @@ export async function callGemini(rawText: string, apiKey: string): Promise<strin
       body: JSON.stringify({
         contents: [{ parts: [{ text: buildPrompt(rawText) }] }],
         generationConfig: {
-          temperature: 0.2,
+          temperature: 0.1,
           responseMimeType: "application/json",
+          responseSchema: CLASSIFIER_RESPONSE_SCHEMA,
         },
       }),
     });

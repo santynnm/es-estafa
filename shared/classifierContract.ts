@@ -35,7 +35,7 @@ export function isClassifierResult(value: unknown): value is ClassifierResult {
   return (
     isRiskLevel(v.risk_level) &&
     Array.isArray(v.signals) &&
-    v.signals.every((s) => typeof s === "string") &&
+    v.signals.every((s) => typeof s === "string" && s.trim().length > 0) &&
     typeof v.explanation === "string" &&
     v.explanation.trim().length > 0 &&
     typeof v.recommended_action === "string" &&
