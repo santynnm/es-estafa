@@ -1,6 +1,6 @@
 import { buildPrompt } from "./prompt.js";
 
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+export const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const REQUEST_TIMEOUT_MS = 20_000;
 
 // Esquema enviado a Gemini para pedir salida JSON estructurada (mejora la
@@ -22,11 +22,23 @@ const CLASSIFIER_RESPONSE_SCHEMA = {
 export class GeminiError extends Error {}
 export class InvalidGeminiResponseError extends Error {}
 
-// Devuelve el texto crudo generado por Gemini para raw_text. La validación
-// contra el contrato del clasificador (sección 8) se hace en api/analyze.ts,
-// no acá, para mantener esta función enfocada solo en hablar con Gemini.
-export async function callGemini(rawText: string, apiKey: string): Promise<string> {
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+interface GenerateContentPart {
+  text?: string;
+  inlineData?: { mimeType: string; data: string };
+}
+
+interface GenerateContentParams {
+  model?: string;
+  parts: GenerateContentPart[];
+  generationConfig: Record<string, unknown>;
+}
+
+// Llamada de bajo nivel a generateContent, compartida por la clasificación de
+// texto (callGemini) y la extracción visual (api/_lib/vision.ts). No sabe
+// nada de clasificar riesgo ni de OCR — solo habla con la API de Gemini y
+// devuelve el texto crudo de la primera respuesta.
+async function generateContent(params: GenerateContentParams, apiKey: string): Promise<string> {
+  const model = params.model || process.env.GEMINI_MODEL || DEFAULT_MODEL;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const controller = new AbortController();
@@ -39,12 +51,8 @@ export async function callGemini(rawText: string, apiKey: string): Promise<strin
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        contents: [{ parts: [{ text: buildPrompt(rawText) }] }],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: "application/json",
-          responseSchema: CLASSIFIER_RESPONSE_SCHEMA,
-        },
+        contents: [{ parts: params.parts }],
+        generationConfig: params.generationConfig,
       }),
     });
   } catch (err) {
@@ -72,3 +80,23 @@ export async function callGemini(rawText: string, apiKey: string): Promise<strin
   }
   return text;
 }
+
+// Devuelve el texto crudo generado por Gemini para raw_text. La validación
+// contra el contrato del clasificador (sección 8) se hace en api/analyze.ts,
+// no acá, para mantener esta función enfocada solo en hablar con Gemini.
+export async function callGemini(rawText: string, apiKey: string): Promise<string> {
+  return generateContent(
+    {
+      parts: [{ text: buildPrompt(rawText) }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+        responseSchema: CLASSIFIER_RESPONSE_SCHEMA,
+      },
+    },
+    apiKey,
+  );
+}
+
+export { generateContent };
+export type { GenerateContentPart };

@@ -21,9 +21,9 @@ export interface ClassifierResult {
 
 export const RISK_LEVELS: readonly RiskLevel[] = ["bajo", "medio", "alto"];
 
-// Únicamente "text" está habilitado en esta etapa (Día 1). Los otros valores
-// del contrato quedan reservados para etapas futuras (Día 3-4 y sección 14).
-export const SUPPORTED_SOURCE_TYPES: readonly SourceType[] = ["text"];
+// "text" (Día 1) e "image_ocr" (Día 3-4A) están habilitados. "audio_transcript"
+// queda reservado para una etapa futura (sección 14), sin implementarse todavía.
+export const SUPPORTED_SOURCE_TYPES: readonly SourceType[] = ["text", "image_ocr"];
 
 export function isRiskLevel(value: unknown): value is RiskLevel {
   return typeof value === "string" && (RISK_LEVELS as string[]).includes(value);

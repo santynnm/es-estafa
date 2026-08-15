@@ -17,8 +17,9 @@ funcionando de punta a punta.
   y revisando que `dist/` no contenga la clave ni la URL de Gemini).
 
 El contrato del clasificador (`shared/classifierContract.ts`) es compartido entre
-frontend y backend y no debe modificarse: es lo que permite agregar `image_ocr` (Día 3-4)
-y `audio_transcript` (a futuro) sin tocar el núcleo.
+frontend y backend y no debe modificarse: es lo que permitió agregar `image_ocr`
+(Día 3-4A, pipeline backend) sin tocar el núcleo del clasificador, y lo mismo para
+`audio_transcript` en una etapa futura.
 
 ## Instalar dependencias
 
@@ -100,6 +101,40 @@ PASS/FAIL, y al final un resumen. Termina con exit code distinto de 0 si algún 
 (sirve para CI). Correlo más de una vez si querés chequear consistencia entre corridas —
 el resultado de `risk_level` debería ser estable aunque la redacción de `signals`/
 `explanation` varíe levemente.
+
+## Pipeline de imagen → texto → clasificador (Día 3-4A)
+
+Además del análisis de texto, hay un endpoint separado `api/extract-image.ts` que
+transcribe el texto visible de una captura de pantalla (imagen → `raw_text`, sin
+clasificar riesgo) usando la visión de Gemini. Ese texto extraído se manda después a
+`/api/analyze` con `source_type: "image_ocr"`, reutilizando el mismo clasificador
+calibrado del Día 2 — no hay un prompt de riesgo separado para imágenes. Todavía **no
+hay interfaz de subida** en el frontend; esta etapa es solo el pipeline backend.
+
+`/api/extract-image` recibe:
+
+```json
+{ "image_base64": "contenido base64 sin el prefijo data:", "mime_type": "image/png | image/jpeg | image/webp" }
+```
+
+y devuelve `{ "raw_text": "..." }`, o un error controlado si el `mime_type` no está
+permitido, el base64 no es válido, la imagen decodificada supera 3 MB, o no hay texto
+legible (nunca se llama al clasificador en esos casos). Las imágenes no se guardan en
+ningún lado — se procesan en memoria para esa única request y se descartan.
+
+Hay un conjunto de pruebas reproducible en `scripts/eval-image-pipeline.mts`, con
+fixtures pequeñas y sin datos reales en `tests/fixtures/` (una captura generada
+localmente con el mensaje de estafa de "tarjeta bloqueada" de la sección 10, en PNG/JPEG/
+WebP, más una imagen sin texto):
+
+```bash
+npm run eval:image                                      # contra producción
+EVAL_BASE_URL=http://localhost:3000 npm run eval:image   # contra vercel dev en local
+```
+
+Cubre: PNG válido, WebP válido, MIME inválido, base64 inválido, imagen > 3 MB, imagen sin
+texto legible, y el flujo de integración completo (imagen de estafa → extracción →
+`/api/analyze` con `image_ocr` → `risk_level: "alto"`).
 
 ## Deploy (Vercel)
 
