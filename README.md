@@ -176,6 +176,69 @@ Cubre: PNG válido, WebP válido, MIME inválido, base64 inválido, imagen > 3 M
 texto legible, y el flujo de integración completo (imagen de estafa → extracción →
 `/api/analyze` con `image_ocr` → `risk_level: "alto"`).
 
+## Contactos familiares (Día 5-6B)
+
+Cada usuario autenticado puede guardar contactos de confianza (nombre + email) para,
+en una etapa futura (Día 7), avisarles por email si un análisis da riesgo medio o alto.
+Por ahora esta sección solo hace alta, listado y baja — todavía no envía nada.
+
+### Esquema (`family_contacts`)
+
+| Columna | Tipo | Notas |
+|---|---|---|
+| `id` | `uuid` | PK, generado automáticamente (`gen_random_uuid()`) |
+| `user_id` | `uuid` | FK a `auth.users(id)`, `on delete cascade`, obligatorio |
+| `nombre` | `text` | obligatorio, no vacío, máx. 200 caracteres |
+| `email` | `text` | obligatorio, no vacío, formato válido, máx. 320 caracteres |
+| `created_at` | `timestamptz` | default `now()` |
+
+Sin límite de cantidad de contactos por usuario. Un mismo email no puede cargarse dos
+veces para el mismo usuario (índice único case-insensitive en `(user_id, lower(email))`);
+sí puede repetirse entre usuarios distintos.
+
+### Aplicar la migración
+
+La migración vive versionada en `supabase/migrations/20260816033400_family_contacts.sql`.
+Para aplicarla a un proyecto de Supabase:
+
+```bash
+npx supabase login                       # pide un access token (supabase.com/dashboard/account/tokens)
+npx supabase link --project-ref TU_REF   # conecta el repo al proyecto
+npx supabase db push                     # aplica las migraciones pendientes
+```
+
+(La migración ya está aplicada en el proyecto de producción "Codercup Project"; estos
+pasos son para replicarla en otro proyecto — por ejemplo, para desarrollo local.)
+
+### Row Level Security
+
+RLS está habilitado en `family_contacts` con tres políticas, todas restringidas al rol
+`authenticated` (nada para `anon` — sin sesión, no hay acceso):
+
+- **`family_contacts_select_own`**: `SELECT` solo donde `auth.uid() = user_id`.
+- **`family_contacts_insert_own`**: `INSERT` solo si el `user_id` insertado coincide con
+  `auth.uid()` (evita que alguien inserte contactos a nombre de otro usuario).
+- **`family_contacts_delete_own`**: `DELETE` solo donde `auth.uid() = user_id`.
+
+No hay política de `UPDATE` — esta etapa solo implementa alta, listado y baja. El
+frontend (`src/lib/contacts.ts`) usa siempre la sesión del usuario logueado con la
+`anon key` pública; la `service_role key` no se usa ni se expone en ningún lado del
+cliente.
+
+### Verificar aislamiento entre usuarios manualmente
+
+1. Creá (o usá) dos usuarios distintos — podés hacerlo desde la propia app con "Crear
+   cuenta", o desde el dashboard (**Authentication → Users → Add user**).
+2. Iniciá sesión con el usuario A y agregá un contacto.
+3. Cerrá sesión e iniciá con el usuario B: la lista de A no debería aparecer.
+4. Con las DevTools abiertas (o la consola del navegador), intentá ejecutar, logueado
+   como B, una consulta directa a un contacto de A por `id` (por ejemplo, copiando el
+   `id` desde el dashboard de Supabase y corriendo
+   `supabase.from('family_contacts').select('*').eq('id', 'EL_ID_DE_A')` en la consola)
+   — RLS tiene que devolver una lista vacía, no el contacto.
+5. Repetí el mismo intento con `.delete()` en vez de `.select()`: tiene que devolver
+   `data: []` (cero filas afectadas), y el contacto de A tiene que seguir existiendo.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`
