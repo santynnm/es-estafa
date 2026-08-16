@@ -6,8 +6,9 @@ Gemini y se muestra un veredicto de riesgo (bajo/medio/alto) con señales, expli
 una acción recomendada. Ver `indicaciones.md` para la especificación completa del
 proyecto.
 
-Por ahora **no hay login ni persistencia**: ni el texto ni las imágenes se guardan en
-ningún lado, se procesan solo para responder la petición en curso.
+Desde el Día 5-6A la app requiere una cuenta (Supabase Auth, email + contraseña) para
+usar el analizador. Ni el texto ni las imágenes se guardan en ningún lado — se procesan
+solo para responder la petición en curso.
 
 ## Stack
 
@@ -46,6 +47,30 @@ npm install
 
 `.env` está en `.gitignore`: nunca se commitea.
 
+## Configurar Supabase Auth (Día 5-6A)
+
+La app usa [Supabase](https://supabase.com) Auth con email + contraseña para proteger el
+analizador. Nada de esto toca base de datos ni Storage todavía — solo Auth.
+
+1. Creá un proyecto gratuito en [supabase.com](https://supabase.com/dashboard) (o usá uno
+   existente).
+2. En el dashboard del proyecto → **Settings → API**, copiá:
+   - **Project URL** → pegalo en `.env` como `VITE_SUPABASE_URL`.
+   - **anon / public key** → pegalo en `.env` como `VITE_SUPABASE_ANON_KEY`.
+
+   Ambas son públicas por diseño (van al bundle del navegador, protegidas por Row Level
+   Security del lado de Supabase). **Nunca** uses la `service_role` key acá — esa key
+   tiene privilegios de administrador y no debe existir en el frontend.
+3. Confirmación de email: por defecto Supabase pide confirmar el email antes de dar una
+   sesión al registrarse (**Authentication → Providers → Email → "Confirm email"**). Con
+   eso activado, `signUp` no devuelve sesión inmediata y la UI muestra "revisá tu correo
+   para confirmar la cuenta". Para probar más rápido en desarrollo podés desactivar esa
+   opción (la app ya maneja los dos casos: con y sin confirmación).
+4. Crear un usuario de prueba — dos formas:
+   - Desde la propia app: "Crear cuenta" con cualquier email/contraseña (≥6 caracteres).
+   - Desde el dashboard: **Authentication → Users → Add user** (podés crear uno ya
+     confirmado, sin pasar por el flujo de email).
+
 ## Ejecutar localmente
 
 Para levantar frontend **y** la función `/api/analyze` juntos (necesario para probar el
@@ -65,6 +90,10 @@ van a fallar con un error de conexión, ya que no hay servidor atendiéndolas):
 ```bash
 npm run dev
 ```
+
+El login funciona igual con `npm run dev` solo (Vite lee `VITE_SUPABASE_URL` y
+`VITE_SUPABASE_ANON_KEY` de `.env` directamente, sin pasar por `/api/`) — lo que no
+funciona sin `vercel dev` es el análisis en sí, una vez que ya estás adentro.
 
 ## Build y chequeos
 
@@ -165,9 +194,12 @@ Vite automáticamente y despliega `api/` como funciones serverless).
 2. Iniciar sesión: `vercel login`.
 3. Desde la carpeta del proyecto: `vercel` (preview) o `vercel --prod` (producción).
 4. En el dashboard de Vercel del proyecto, ir a **Settings → Environment Variables** y
-   cargar `GEMINI_API_KEY` (y opcionalmente `GEMINI_MODEL`) para los entornos
-   Production/Preview/Development.
-5. Volver a desplegar (`vercel --prod`) para que la función tome la variable.
+   cargar, para los entornos Production/Preview/Development:
+   - `GEMINI_API_KEY` (y opcionalmente `GEMINI_MODEL`).
+   - `VITE_SUPABASE_URL` y `VITE_SUPABASE_ANON_KEY`.
+5. Volver a desplegar (`vercel --prod`) para que build tome las variables (las `VITE_*`
+   se inyectan en tiempo de build, no de runtime — por eso hace falta redeployar después
+   de cargarlas o cambiarlas, no alcanza con solo guardarlas).
 
 Alternativas equivalentes (requieren adaptar la función de `api/` al formato del
 proveedor): Netlify Functions o Cloudflare Pages Functions.
@@ -178,3 +210,7 @@ proveedor): Netlify Functions o Cloudflare Pages Functions.
   bancarios reales — se lo advierte de forma visible antes del formulario.
 - El resultado siempre se acompaña de un disclaimer: la herramienta orienta, no
   garantiza certeza absoluta; ante la duda, verificar por el canal oficial.
+- El analizador está protegido por Supabase Auth: sin sesión, solo se puede ver la
+  pantalla de login/registro. La `anon key` de Supabase es pública por diseño (va al
+  bundle); la `service_role key` nunca debe cargarse en variables `VITE_*` ni usarse del
+  lado del cliente.
