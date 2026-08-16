@@ -25,6 +25,7 @@
     "@types/react-dom": "^19.2.3",
     "@vercel/node": "^5.10.0",
     "@vitejs/plugin-react": "^6.0.4",
+    "dotenv": "^17.4.2",
     "oxlint": "^1.75.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.23.12",

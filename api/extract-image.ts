@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { extractTextFromImage } from "./_lib/vision.js";
 import { GeminiError, InvalidGeminiResponseError } from "./_lib/gemini.js";
 import { respondToGeminiError } from "./_lib/httpErrors.js";
+import { requireAuth, respondToAuthError } from "./_lib/auth.js";
 
 const ALLOWED_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MAX_DECODED_BYTES = 3 * 1024 * 1024; // 3 MB — margen respecto del límite de body de Vercel.
@@ -22,6 +23,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Método no permitido." });
     return;
+  }
+
+  try {
+    await requireAuth(req);
+  } catch (err) {
+    if (respondToAuthError(res, err)) return;
+    throw err;
   }
 
   const apiKey = process.env.GEMINI_API_KEY;

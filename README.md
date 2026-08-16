@@ -113,6 +113,21 @@ Con `vercel dev` corriendo y `GEMINI_API_KEY` configurada, pegá un texto como:
 y tocá "Analizar". Deberías ver un resultado con nivel de riesgo, señales detectadas,
 una explicación simple y una acción recomendada.
 
+## Endpoints protegidos con sesión de Supabase
+
+`/api/analyze` y `/api/extract-image` requieren un usuario autenticado: exigen el header
+`Authorization: Bearer <access_token>` con un JWT válido de Supabase (verificado contra
+la misma URL/anon key públicas, nunca la service role key). Sin ese header, con un token
+inventado o vencido, devuelven `401` — incluso antes de mirar el body de la request. El
+frontend (`src/lib/api.ts`) pide el token actual con `supabase.auth.getSession()` en cada
+llamada (nunca lo guarda en una variable propia, así siempre usa uno vigente) y lo agrega
+solo; no hay nada manual que hacer para usar la app normalmente.
+
+Si necesitás llamar a los endpoints vos mismo (por ejemplo con `curl`), primero necesitás
+un access token real de un usuario de Supabase. `scripts/evalAuth.mts` (usado por los
+scripts de evaluación de abajo) es la referencia más simple de cómo conseguirlo por
+código, con `supabase.auth.signInWithPassword(...)`.
+
 ## Evaluar el clasificador (Día 2)
 
 Hay un conjunto de evaluación reproducible en `scripts/eval-classifier.mts` con los seis
@@ -120,6 +135,24 @@ casos de la sección 10 de `indicaciones.md` (cinco de estafa + un control neutr
 tres casos de robustez: intento de inyección de instrucciones dentro del texto, un
 mensaje urgente pero legítimo (para chequear que no se marque como riesgo alto solo por
 tener urgencia), y texto vacío. Llama al endpoint real `/api/analyze` — no usa mocks.
+
+Como el endpoint ahora requiere sesión, el script primero inicia sesión con un usuario de
+evaluación (`scripts/evalAuth.mts`, compartido también por `eval-image-pipeline.mts`) y
+usa ese access token en cada request. Las credenciales se leen exclusivamente de
+variables de entorno — nunca hardcodeadas —, definidas en `.env` (se cargan solas vía
+`dotenv`) o exportadas en la shell:
+
+```bash
+# .env (o exportadas en la shell antes de correr el script)
+EVAL_USER_EMAIL=tu-usuario-de-prueba@example.com
+EVAL_USER_PASSWORD=tu-contraseña-de-prueba
+```
+
+Usá una cuenta de prueba dedicada, no una cuenta real — podés crearla con "Crear cuenta"
+en la propia app, o desde **Authentication → Users → Add user** en el dashboard de
+Supabase. Si falta alguna de las dos variables (o `VITE_SUPABASE_URL`/
+`VITE_SUPABASE_ANON_KEY`), el script se corta con un mensaje claro que dice qué falta,
+sin imprimir ningún valor.
 
 ```bash
 npm run eval                                      # contra la producción (https://codercup.vercel.app)

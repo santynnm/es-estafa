@@ -1,4 +1,5 @@
 import type { ClassifierRequest, ClassifierResult } from "../../shared/classifierContract";
+import { supabase } from "./supabaseClient";
 
 export class AnalyzeError extends Error {}
 
@@ -22,12 +23,24 @@ interface ExtractImageResponse {
 
 // POST genérico con el manejo de errores compartido entre analyzeRawText y
 // extractTextFromImage, para no duplicarlo entre el modo texto y el modo imagen.
+// Incluye siempre el access token actual de la sesión: se pide con
+// getSession() en cada llamada (Supabase lo renueva solo en segundo plano),
+// nunca se guarda en una variable propia que podría vencerse.
 async function postJson<TResponse>(url: string, payload: unknown): Promise<TResponse> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  const accessToken = sessionData.session?.access_token;
+  if (!accessToken) {
+    throw new AnalyzeError("Se cerró tu sesión. Volvé a ingresar para continuar.");
+  }
+
   let response: Response;
   try {
     response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
       body: JSON.stringify(payload),
     });
   } catch {

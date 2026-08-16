@@ -3,11 +3,16 @@
 // sección 10 de indicaciones.md más tres casos de robustez, y reporta un
 // PASS/FAIL por caso reutilizando el validador real del contrato.
 //
+// Los endpoints requieren sesión desde la corrección previa al Día 7 — el
+// script inicia sesión con un usuario de evaluación antes de correr los
+// casos. Ver EVAL_USER_EMAIL/EVAL_USER_PASSWORD en .env.example.
+//
 // Uso:
 //   npm run eval                                   # contra la URL de prod (https://codercup.vercel.app)
 //   EVAL_BASE_URL=http://localhost:3000 npm run eval   # contra vercel dev en local
 
 import { isClassifierResult, type RiskLevel } from "../shared/classifierContract.ts";
+import { getEvalAccessToken } from "./evalAuth.mts";
 
 const BASE_URL = process.env.EVAL_BASE_URL || "https://codercup.vercel.app";
 
@@ -93,10 +98,10 @@ const cases: EvalCase[] = [
   },
 ];
 
-async function runCase(c: EvalCase) {
+async function runCase(c: EvalCase, accessToken: string) {
   const res = await fetch(`${BASE_URL}/api/analyze`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({ raw_text: c.raw_text, source_type: "text" }),
   });
   const body: unknown = await res.json().catch(() => null);
@@ -163,13 +168,14 @@ async function runCase(c: EvalCase) {
 }
 
 async function main() {
+  const accessToken = await getEvalAccessToken();
   console.log(`Evaluando clasificador contra: ${BASE_URL}/api/analyze\n`);
 
   const results = [];
   for (const c of cases) {
     process.stdout.write(`- ${c.id} ... `);
     try {
-      const r = await runCase(c);
+      const r = await runCase(c, accessToken);
       results.push(r);
       console.log(r.pass ? "PASS" : `FAIL (${r.reason})`);
     } catch (err) {

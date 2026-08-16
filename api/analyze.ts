@@ -7,6 +7,7 @@ import {
 } from "../shared/classifierContract.js";
 import { callGemini, GeminiError, InvalidGeminiResponseError } from "./_lib/gemini.js";
 import { respondToGeminiError } from "./_lib/httpErrors.js";
+import { requireAuth, respondToAuthError } from "./_lib/auth.js";
 
 const MAX_RAW_TEXT_LENGTH = 6000;
 
@@ -14,6 +15,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Método no permitido." });
     return;
+  }
+
+  try {
+    await requireAuth(req);
+  } catch (err) {
+    if (respondToAuthError(res, err)) return;
+    throw err;
   }
 
   const apiKey = process.env.GEMINI_API_KEY;

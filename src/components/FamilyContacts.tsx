@@ -1,6 +1,14 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useAuth } from "../lib/useAuth";
-import { listContacts, addContact, deleteContact, ContactsError, type FamilyContact } from "../lib/contacts";
+import {
+  listContacts,
+  addContact,
+  deleteContact,
+  ContactsError,
+  MAX_NOMBRE_LENGTH,
+  MAX_EMAIL_LENGTH,
+  type FamilyContact,
+} from "../lib/contacts";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -53,8 +61,16 @@ export function FamilyContacts() {
       setAddError("Ingresá un nombre.");
       return;
     }
+    if (trimmedNombre.length > MAX_NOMBRE_LENGTH) {
+      setAddError(`El nombre es demasiado largo (máximo ${MAX_NOMBRE_LENGTH} caracteres).`);
+      return;
+    }
     if (!trimmedEmail || !EMAIL_PATTERN.test(trimmedEmail)) {
       setAddError("El email no tiene un formato válido.");
+      return;
+    }
+    if (trimmedEmail.length > MAX_EMAIL_LENGTH) {
+      setAddError(`El email es demasiado largo (máximo ${MAX_EMAIL_LENGTH} caracteres).`);
       return;
     }
     if (contacts?.some((c) => c.email.toLowerCase() === trimmedEmail.toLowerCase())) {
@@ -128,7 +144,7 @@ export function FamilyContacts() {
               className="flex flex-col gap-3 rounded-xl border-2 border-gray-300 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:border-gray-700 dark:bg-gray-900"
             >
               <div className="min-w-0">
-                <p className="font-semibold">{c.nombre}</p>
+                <p className="break-words font-semibold">{c.nombre}</p>
                 <p className="truncate text-sm text-gray-600 dark:text-gray-400">{c.email}</p>
               </div>
 
@@ -184,6 +200,7 @@ export function FamilyContacts() {
             type="text"
             value={nombre}
             onChange={(e) => setNombre(e.target.value)}
+            maxLength={MAX_NOMBRE_LENGTH}
             disabled={addLoading}
             className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
           />
@@ -198,6 +215,7 @@ export function FamilyContacts() {
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            maxLength={MAX_EMAIL_LENGTH}
             disabled={addLoading}
             className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
           />
