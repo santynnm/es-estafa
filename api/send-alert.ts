@@ -193,7 +193,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // idempotencyKey = el UUID de la propia alerta: estable en todos los
     // reintentos de esta misma fila, namespaced por diseño (una alerta =
     // un check + un contacto, ya garantizado por el unique constraint).
-    const messageId = await sendAlertEmail(
+    const result = await sendAlertEmail(
       {
         to: contact.email,
         contactName: contact.nombre,
@@ -204,11 +204,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       alertId,
     );
-    // Brevo no ofrece idempotencia real en este endpoint (ver
-    // api/_lib/brevo.ts) — se loguea el messageId devuelto, junto con el id
-    // de la alerta, para poder reconciliar manualmente contra el dashboard
-    // de Brevo si hiciera falta.
-    console.log("Brevo aceptó el envío. alertId:", alertId, "messageId:", messageId);
+    // result.alreadyProcessed === true: Brevo respondió `duplicate_parameter`
+    // (ver api/_lib/brevo.ts) — significa que un envío anterior con este
+    // mismo alertId ya fue aceptado dentro de los últimos 30 minutos, no que
+    // este intento falló. Se trata igual que un envío exitoso: se transiciona
+    // a `sent` sin haber generado un email nuevo en esta llamada. Se loguea
+    // el messageId (cuando lo hay) junto con el id de la alerta, para poder
+    // reconciliar manualmente contra el dashboard de Brevo si hiciera falta.
+    if (result.alreadyProcessed) {
+      console.log("Brevo ya había procesado este envío (duplicate_parameter). alertId:", alertId);
+    } else {
+      console.log("Brevo aceptó el envío. alertId:", alertId, "messageId:", result.messageId);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
 

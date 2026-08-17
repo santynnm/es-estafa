@@ -1,4 +1,4 @@
-import { BrevoClient } from "@getbrevo/brevo";
+import { BrevoClient, BrevoError } from "@getbrevo/brevo";
 import type { RiskLevel } from "../../shared/classifierContract.js";
 
 export class EmailConfigError extends Error {}
@@ -11,6 +11,14 @@ interface AlertEmailParams {
   signals: string[];
   explanation: string;
   recommendedAction: string;
+}
+
+export interface SendAlertEmailResult {
+  messageId?: string;
+  // true si Brevo respondió que esta idempotencyKey ya fue procesada dentro
+  // del TTL (ver isDuplicateParameterError) — no se generó un email nuevo
+  // en esta llamada, pero el envío original ya fue aceptado por Brevo.
+  alreadyProcessed: boolean;
 }
 
 // Arma el cuerpo del email en texto plano (sin HTML): evita cualquier
@@ -41,21 +49,45 @@ function buildAlertEmailText(params: AlertEmailParams): string {
   ].join("\n");
 }
 
+// Detecta específicamente el rechazo de idempotencia de Brevo: HTTP 400 con
+// body.code === "duplicate_parameter". Confirmado empíricamente (no solo
+// por documentación) llamando dos veces seguidas a sendTransacEmail con el
+// mismo headers.idempotencyKey: la primera devuelve un messageId real, la
+// segunda tira exactamente este error, y el panel de Brevo
+// (getTransacEmailsList) confirma un único email real entregado, no dos. No
+// se compara el texto de err.message (frágil, puede cambiar de idioma) —
+// solo el código estructurado del body, con un type guard acotado.
+function isDuplicateParameterError(err: unknown): boolean {
+  if (!(err instanceof BrevoError)) return false;
+  if (err.statusCode !== 400) return false;
+  const body = err.body;
+  if (typeof body !== "object" || body === null || !("code" in body)) return false;
+  return (body as { code?: unknown }).code === "duplicate_parameter";
+}
+
 // idempotencyKey: se reutiliza el UUID de la fila de alerts_sent (ver
-// api/send-alert.ts) también acá, pero a diferencia de Resend, el endpoint
-// de envío individual de Brevo (transactionalEmails.sendTransacEmail) NO
-// ofrece una clave de idempotencia real a nivel de API — el tipo instalado
-// (SendTransacEmailRequest.headers) solo documenta "Idempotency-Key" como
-// ejemplo de header MIME de salida (cosmético, lo ve el destinatario, no
-// deduplica nada del lado de Brevo). La única deduplicación mecánica que
-// existe en el SDK es para el envío por lotes (messageVersions), que no es
-// el que usamos acá (un destinatario por llamada). Por eso: (a) igual se
-// manda el header, sin costo y sin efecto dañino, por si algún día Brevo lo
-// empieza a usar; (b) la protección real contra duplicados sigue siendo
-// exclusivamente el compare-and-set en Postgres (api/send-alert.ts); (c) se
-// guarda el messageId que devuelve Brevo en error_message/logs para poder
-// reconciliar manualmente contra el dashboard de Brevo si hiciera falta.
-export async function sendAlertEmail(params: AlertEmailParams, idempotencyKey: string): Promise<string | undefined> {
+// api/send-alert.ts). Va como headers.idempotencyKey en el body de la
+// request — NO es un header HTTP de la llamada a la API ni tampoco (pese a
+// la documentación ambigua de Brevo, que describe el campo `headers` como
+// "custom email headers") un header cosmético del email de salida: es un
+// campo especial que la propia API de Brevo intercepta para deduplicar,
+// con un TTL documentado de 30 minutos
+// (https://developers.brevo.com/docs/heterogenous-versions-batch-emails).
+// Reutilizar el mismo alertId en todos los reintentos de una misma alerta
+// hace que, si Brevo ya proceso ese envío dentro de los últimos 30
+// minutos, el reintento sea rechazado con `duplicate_parameter` en vez de
+// generar un segundo email real — comportamiento verificado con envíos
+// reales, no asumido de la documentación.
+//
+// Pasado el TTL de 30 minutos, un reintento con la misma clave ya no está
+// garantizado como duplicado por Brevo y podría generar un email nuevo —
+// por eso esta idempotencia de proveedor es un complemento, no un
+// reemplazo, del compare-and-set en Postgres (api/send-alert.ts), que seguí
+// siendo la única barrera con garantía indefinida en el tiempo:
+// unique(check_id, contact_id) impide directamente que se cree una segunda
+// fila `pending` para el mismo par análisis+contacto, sin importar cuánto
+// haya pasado.
+export async function sendAlertEmail(params: AlertEmailParams, idempotencyKey: string): Promise<SendAlertEmailResult> {
   const apiKey = process.env.BREVO_API_KEY;
   const senderEmail = process.env.BREVO_SENDER_EMAIL;
   const senderName = process.env.BREVO_SENDER_NAME;
@@ -72,10 +104,14 @@ export async function sendAlertEmail(params: AlertEmailParams, idempotencyKey: s
       to: [{ email: params.to, name: params.contactName }],
       subject: `Alerta de posible estafa — riesgo ${params.riskLevel}`,
       textContent: buildAlertEmailText(params),
-      headers: { "Idempotency-Key": idempotencyKey },
+      headers: { idempotencyKey },
     });
-    return response.messageId;
+    return { messageId: response.messageId, alreadyProcessed: false };
   } catch (err) {
+    if (isDuplicateParameterError(err)) {
+      console.log("Brevo confirmó que esta idempotencyKey ya fue procesada (duplicate_parameter). alertId:", idempotencyKey);
+      return { alreadyProcessed: true };
+    }
     // No propagamos el mensaje crudo de Brevo al cliente final (podría
     // incluir detalles internos) — solo lo logueamos server-side. Nunca
     // logueamos la API key ni el cuerpo completo de la request/response.

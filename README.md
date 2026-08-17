@@ -412,32 +412,49 @@ se verifica que haya afectado exactamente una fila antes de confiar en el result
 confirmación final a `sent` no puede aplicarse de forma consistente, el endpoint responde
 `500` en vez de devolver `{ "status": "sent" }` sin esa garantía.
 
-**Idempotencia — Brevo NO la garantiza para este endpoint (hallazgo verificado, no
-simulado)**: se investigó tanto la documentación oficial como los tipos instalados del
-SDK (`node_modules/@getbrevo/brevo/dist/cjs/api/resources/transactionalEmails/client/requests/SendTransacEmailRequest.d.ts`)
-antes de asumir nada. El endpoint de envío individual
-(`transactionalEmails.sendTransacEmail()`, el que usa esta app) **no tiene un parámetro
-de idempotencia real a nivel de API**. Su campo `headers?: Record<string, unknown>`
-documenta un ejemplo `{"Idempotency-Key": "abc-123"}`, pero es un **header MIME de
-salida cosmético** — se adjunta al email, no deduplica nada del lado de Brevo. Esto se
-confirmó empíricamente: dos llamadas directas a `sendAlertEmail()` con la misma
-`idempotencyKey` devolvieron dos `messageId` distintos (dos emails reales enviados), no
-uno. (Brevo sí documenta una idempotencia real de 30 minutos, pero es específica del
-envío por **lotes** vía `messageVersions` — una función que esta app no usa, porque cada
-alerta tiene un único destinatario por llamada.)
+**Idempotencia en Brevo (corrección 7A.1B — hallazgo verificado con envíos reales, no
+asumido de la documentación)**: una primera investigación (corrección 7A.1) concluyó
+—incorrectamente— que Brevo no ofrecía idempotencia real en este endpoint, basándose en
+que el campo `headers` de `SendTransacEmailRequest` está documentado como "custom email
+headers" con un ejemplo `{"Idempotency-Key": "abc-123"}`, que leído aisladamente parece
+un header MIME cosmético del email de salida. Se corrigió esa conclusión tras encontrar
+la página oficial ["Idempotency for batch
+emails"](https://developers.brevo.com/docs/heterogenous-versions-batch-emails) y
+**confirmarla con una prueba real, no solo con la documentación**: dos llamadas directas
+a `sendAlertEmail()` con el mismo `idempotencyKey` (vía `headers: { idempotencyKey }`,
+en `camelCase`, dentro del body de la request — no un header HTTP de la llamada, ni un
+header del email saliente, sino un campo especial que la API de Brevo intercepta) dieron
+como resultado: la primera, un `messageId` real; la segunda, un error estructurado real:
 
-Por eso, siguiendo la instrucción explícita de no simular una garantía que el proveedor
-no ofrece: **la única protección real contra duplicados sigue siendo el compare-and-set
-en Postgres** descrito arriba (el `unique(check_id, contact_id)` + las transiciones
-condicionales de `status`), que no depende de Brevo en absoluto y ya se verificó con
-carreras reales (`Promise.all` con dos requests simultáneas sobre la misma alerta
-`failed`: una gana con `200`, la otra recibe `409`, y solo se dispara un email). El
-`messageId` que devuelve Brevo en cada envío exitoso se loguea server-side (junto al
-`alertId`) para poder reconciliar manualmente contra el dashboard de Brevo si hiciera
-falta — no se persiste en la base porque el esquema de `alerts_sent` no tiene una
-columna para eso y agregarla está fuera del alcance de esta corrección. Igual se manda
-el header `Idempotency-Key` en cada request (sin costo ni efecto dañino), por si Brevo
-llega a extender la deduplicación real a este endpoint en el futuro.
+```json
+{ "code": "duplicate_parameter", "message": "Email for the idempotency key has already been processed" }
+```
+
+(HTTP `400`, lanzado por el SDK como `BrevoError` con `statusCode: 400` y ese `body`).
+Se confirmó además contra el propio panel de Brevo
+(`transactionalEmails.getTransacEmailsList()`) que solo existe **un** email real para
+esa prueba, no dos. `api/_lib/brevo.ts` detecta este caso específico con un type guard
+acotado (`err instanceof BrevoError && err.statusCode === 400 && err.body.code ===
+"duplicate_parameter"` — nunca compara el texto de `message`, que podría cambiar de
+idioma) y lo trata como un envío ya confirmado (`alreadyProcessed: true`), no como un
+fallo: `api/send-alert.ts` completa igual la transición `pending → sent`, sin devolver
+`502` ni dejar la alerta en `failed`. Un error de Brevo con cualquier otro `code` (por
+ejemplo `invalid_parameter`) sigue tratándose como un fallo genuino: `EmailSendError`,
+`pending → failed`, `502` — verificado también con una llamada real.
+
+**El TTL documentado por Brevo es de 30 minutos** desde el primer uso de la clave;
+pasado ese margen, un reintento con el mismo `idempotencyKey` ya no está garantizado
+como duplicado y podría generar un email nuevo. Por eso esta idempotencia de proveedor
+es un complemento, no un reemplazo, del **compare-and-set en Postgres** descrito arriba
+(el `unique(check_id, contact_id)` + las transiciones condicionales de `status`), que no
+depende de Brevo ni tiene ventana de expiración: sigue siendo la primera barrera contra
+duplicados, y ya se verificó con carreras reales (`Promise.all` con dos requests
+simultáneas sobre la misma alerta `failed`: una gana con `200`, la otra recibe `409`, y
+solo se dispara/reconfirma un email). El `messageId` que devuelve Brevo en cada envío
+exitoso, y la confirmación de `duplicate_parameter` en los reintentos, se loguean
+server-side junto al `alertId` para poder reconciliar manualmente contra el dashboard de
+Brevo si hiciera falta — no se persisten en la base porque el esquema de `alerts_sent`
+no tiene una columna para eso y agregarla está fuera del alcance de esta corrección.
 
 Respuestas: `401` sin sesión · `400` ids con formato inválido · `404` análisis o contacto
 inexistente/ajeno · `409` ya enviado o en curso (incluye la carrera perdida en un
