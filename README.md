@@ -322,14 +322,44 @@ creados (no hay edición ni historial visible todavía).
 `unique (check_id, contact_id)`: como máximo una alerta por combinación
 análisis+contacto — es la base de la idempotencia (ver abajo).
 
-RLS: `alerts_sent_select_own` y `alerts_sent_insert_own_pending` (esta última solo permite
-insertar con `status = 'pending'`). **No hay política de `update` para nadie** — ni
-siquiera el dueño puede hacer `UPDATE` directo sobre la tabla. La única forma de pasar a
-`sent` o `failed` es la función `set_alert_status(alert_id, status, error_message)`
-(`security definer`, definida en la migración), que igual exige `auth.uid() = user_id`
-internamente antes de tocar la fila. Esto es lo que impide que un cliente marque
-arbitrariamente una alerta como enviada sin pasar por el envío real — la única llave que
-lo puede confirmar de verdad es `RESEND_API_KEY`, que el navegador nunca tiene.
+**Corrección de seguridad** (migración
+`supabase/migrations/20260817004349_alerts_sent_lockdown.sql`, posterior a la creación de
+la tabla): la versión original permitía que el propio usuario insertara una fila
+`pending` y usara una función `security definer` (`set_alert_status`) para transicionar
+el estado. Se detectó que, sin una service role key, no hay forma de distinguir "nuestro
+backend" de "un usuario con su propia sesión llamando a la misma función RPC a mano" — el
+mismo JWT que usa el servidor es el mismo que tiene el usuario. Por eso:
+
+- Se eliminó la política de `INSERT` (`alerts_sent_insert_own_pending`).
+- Se eliminó por completo la función `set_alert_status` (`DROP FUNCTION`, no solo
+  `REVOKE`).
+- Ahora RLS solo deja **`alerts_sent_select_own`** — un usuario autenticado puede
+  consultar sus propias alertas, pero no puede insertar, actualizar, ni invocar nada para
+  cambiarles el estado.
+- Todas las escrituras (crear la fila `pending`, pasar a `sent`/`failed`, reintentar un
+  `failed`) las hace `api/send-alert.ts` con un cliente **service role** (ver
+  `SUPABASE_SERVICE_ROLE_KEY` más abajo), que bypassea RLS por diseño. La única llave que
+  puede confirmar de verdad un envío es `RESEND_API_KEY`, y esa nunca sale del backend.
+- Como el cliente service role ignora RLS, la integridad de "quién es dueño de qué" se
+  garantiza con **foreign keys compuestas**, no con políticas: `alerts_sent` tiene
+  `foreign key (check_id, user_id) references checks (id, user_id)` y
+  `foreign key (contact_id, user_id) references family_contacts (id, user_id)` — ni
+  siquiera el backend puede insertar una fila donde `user_id` no coincida con el dueño
+  real del `check_id` o del `contact_id`, sin importar qué cliente use.
+
+### Identidad privilegiada server-only (`SUPABASE_SERVICE_ROLE_KEY`)
+
+- Se obtiene en el dashboard de Supabase → **Settings → API → service_role**. Es secreta
+  (a diferencia de la anon key, que es pública por diseño).
+- Vive **exclusivamente** en `api/_lib/supabaseAdmin.ts` (`createAdminClient()`), con
+  `persistSession: false` y `autoRefreshToken: false` — no tiene sentido cachear/renovar
+  sesión para una key que no expira sola.
+- **Nunca** lleva prefijo `VITE_` (eso la incluiría en el bundle del navegador), **nunca**
+  se importa desde `src/`, y no se loguea en ningún lado.
+- Se usa únicamente para las escrituras de `alerts_sent`. Las lecturas de `checks` y
+  `family_contacts` en `api/send-alert.ts` siguen usando `createUserScopedClient()` (RLS
+  normal) — el cliente admin no reemplaza esas lecturas, solo evita que la falta de una
+  política de escritura bloquee al propio backend.
 
 ### `/api/analyze` — persistencia
 
@@ -357,16 +387,41 @@ Resend). El email es texto plano (nombre del contacto, nivel, señales, explicac
 acción recomendada y el disclaimer de siempre) — nunca el `raw_text` completo, ni
 tokens, ni la imagen original.
 
-**Idempotencia**: la primera request para un par (`check_id`, `contact_id`) inserta una
-fila `pending`, protegida por el `unique` de la tabla — si dos requests llegan casi al
-mismo tiempo, la base solo deja pasar un `INSERT`, la otra recibe automáticamente el
-conflicto y el endpoint responde `409`. Si ya está `sent`, también `409`. Si quedó
-`failed` (por ejemplo, un error temporal de Resend), se puede reintentar: esa misma
-request reutiliza la fila existente en vez de crear una nueva.
+**Idempotencia en la base (compare-and-set)**: la primera request para un par
+(`check_id`, `contact_id`) inserta una fila `pending`, protegida por el `unique` de la
+tabla — si dos requests llegan casi al mismo tiempo, la base solo deja pasar un `INSERT`,
+la otra recibe automáticamente el conflicto (`23505`) y el endpoint responde `409`. Si ya
+está `sent`, también `409`. Si quedó `failed` (por ejemplo, un error temporal de Resend),
+el reintento hace `UPDATE ... SET status = 'pending' WHERE id = ... AND status = 'failed'`
+— es decir, **solo transiciona si el estado seguía siendo exactamente `failed`** en el
+momento del `UPDATE`. Postgres serializa los `UPDATE` concurrentes sobre la misma fila: si
+dos requests intentan este mismo reintento a la vez, la primera en commitear gana (deja el
+estado en `pending`) y la segunda evalúa su `WHERE status = 'failed'` contra el valor ya
+actualizado, no matchea, afecta 0 filas, y el endpoint responde `409` — nunca se disparan
+dos emails para la misma alerta. Las transiciones posteriores (`pending → sent`,
+`pending → failed`) son igual de condicionales: cada `UPDATE` exige `status = 'pending'` y
+se verifica que haya afectado exactamente una fila antes de confiar en el resultado. Si la
+confirmación final a `sent` no puede aplicarse de forma consistente, el endpoint responde
+`500` en vez de devolver `{ "status": "sent" }` sin esa garantía.
+
+**Idempotencia en Resend**: cada llamada a `resend.emails.send()` incluye
+`{ idempotencyKey: alertId }` (el UUID de la fila de `alerts_sent`, vía el segundo
+parámetro `CreateEmailRequestOptions` del SDK — confirmado contra los tipos instalados,
+`node_modules/resend/dist/index.d.mts`), enviado como header `Idempotency-Key`. Como el
+`alertId` es siempre el mismo en todos los reintentos de una misma alerta (nunca se crea
+una fila nueva para un reintento), esto evita un segundo email real si Resend aceptó el
+envío pero se perdió la respuesta, o si el endpoint se reintenta tras un timeout — Resend
+devuelve el mismo `id` de email para la misma `idempotencyKey` en vez de crear uno nuevo.
+**Resend mantiene esta deduplicación durante 24 horas** desde el primer uso de la clave;
+pasado ese margen, un reintento con la misma clave ya no está garantizado como duplicado
+(ver [docs de Resend](https://resend.com/docs/dashboard/emails/idempotency-keys)) — un
+reintento manual más de un día después de un fallo original podría generar un email
+nuevo, algo razonable para este caso de uso.
 
 Respuestas: `401` sin sesión · `400` ids con formato inválido · `404` análisis o contacto
-inexistente/ajeno · `409` ya enviado o en curso · `422` riesgo bajo · `500` config faltante
-o error interno · `502` Resend rechazó el envío.
+inexistente/ajeno · `409` ya enviado o en curso (incluye la carrera perdida en un
+reintento) · `422` riesgo bajo · `500` config faltante, inconsistencia de estado o error
+interno · `502` Resend rechazó el envío.
 
 ### Configurar Resend
 
@@ -379,6 +434,17 @@ o error interno · `502` Resend rechazó el envío.
    **Domains** y usar una dirección de ese dominio.
 3. Cargá `RESEND_API_KEY` y `RESEND_FROM_EMAIL` en `.env` (ver `.env.example`) y, para
    producción, en Vercel (**Settings → Environment Variables**).
+
+**Estado actual (bloqueo externo real, sin resolver):** el proyecto **no tiene un dominio
+propio verificado en Resend**. Producción usa `onboarding@resend.dev`, que Resend
+restringe a entregar únicamente al email con el que se creó la cuenta de Resend — **no a
+un contacto familiar arbitrario**. El flujo funciona end-to-end (confirmado con envíos
+reales), pero solo puede demostrarse con ese único destinatario hasta que se verifique un
+dominio propio en **Resend → Domains** (agregar registros DNS del dominio elegido). No se
+compró ni registró ningún dominio como parte de esta corrección — es una decisión que le
+corresponde al usuario del proyecto, no algo para resolver unilateralmente. Una vez
+verificado un dominio, alcanza con actualizar `RESEND_FROM_EMAIL` a una dirección de ese
+dominio (en `.env` y en Vercel) y volver a desplegar; el resto del código no cambia.
 
 ### Probar un envío real manualmente
 

@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { requireAuth, respondToAuthError, createUserScopedClient, type AuthenticatedUser } from "./_lib/auth.js";
+import { createAdminClient, AdminConfigError } from "./_lib/supabaseAdmin.js";
 import { sendAlertEmail, ResendConfigError, ResendSendError } from "./_lib/resend.js";
 import type { RiskLevel } from "../shared/classifierContract.js";
 
@@ -25,12 +26,25 @@ interface ContactRow {
   email: string;
 }
 
+interface AlertRow {
+  id: string;
+  status: string;
+}
+
 // Envía una alerta por email a un contacto familiar para un análisis ya
 // persistido (api/analyze.ts) con riesgo medio/alto. No recibe del cliente
 // nada más que los dos ids: destinatario, nivel de riesgo, señales,
 // explicación y acción recomendada se recuperan de Supabase con la sesión
 // del usuario (RLS), nunca se confía en lo que mande el body para esos
 // datos. No vuelve a llamar a Gemini — solo lee lo que ya se clasificó.
+//
+// Las lecturas de checks/family_contacts usan createUserScopedClient()
+// (RLS = barrera de ownership). Las escrituras en alerts_sent usan el
+// cliente admin (service role) porque esa tabla ya no tiene ninguna
+// política de insert/update para el rol authenticated — es la única forma
+// de que exista una fila "pending"/"sent"/"failed", y las transiciones son
+// siempre compare-and-set (UPDATE ... WHERE status = '<esperado>') para
+// que dos requests simultáneas no puedan ganar ambas la misma transición.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Método no permitido." });
@@ -54,12 +68,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const supabase = createUserScopedClient(user.accessToken);
+  const userScoped = createUserScopedClient(user.accessToken);
 
   // RLS ya garantiza que solo se puede leer un check/contacto propio — si
   // el id pertenece a otro usuario, esto devuelve "sin filas", no un error,
-  // así que no filtramos si existe para otra cuenta.
-  const { data: check, error: checkError } = await supabase
+  // así que no filtramos si existe para otra cuenta (404 genérico).
+  const { data: check, error: checkError } = await userScoped
     .from("checks")
     .select("id, risk_level, signals, explanation, recommended_action")
     .eq("id", checkId)
@@ -75,7 +89,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const { data: contact, error: contactError } = await supabase
+  const { data: contact, error: contactError } = await userScoped
     .from("family_contacts")
     .select("id, nombre, email")
     .eq("id", contactId)
@@ -96,14 +110,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  // Reclama (o crea) la fila de alerts_sent de forma atómica: el constraint
-  // unique(check_id, contact_id) hace que, ante requests simultáneas, solo
-  // una gane el INSERT — la otra recibe 23505 y cae al camino de abajo.
-  const { data: claimed, error: insertError } = await supabase
+  let admin;
+  try {
+    admin = createAdminClient();
+  } catch (err) {
+    if (err instanceof AdminConfigError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    throw err;
+  }
+
+  // Reclama (o crea) la fila de alerts_sent con el cliente admin. El
+  // constraint unique(check_id, contact_id) garantiza que, ante requests
+  // simultáneas, solo una gane el INSERT — la otra recibe 23505.
+  const { data: claimed, error: insertError } = await admin
     .from("alerts_sent")
     .insert({ user_id: user.id, check_id: checkId, contact_id: contactId, status: "pending" })
-    .select("id")
-    .single<{ id: string }>();
+    .select("id, status")
+    .single<AlertRow>();
 
   let alertId: string;
 
@@ -114,12 +139,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const { data: existing, error: existingError } = await supabase
+    const { data: existing, error: existingError } = await admin
       .from("alerts_sent")
       .select("id, status")
       .eq("check_id", checkId)
       .eq("contact_id", contactId)
-      .maybeSingle<{ id: string; status: string }>();
+      .maybeSingle<AlertRow>();
 
     if (existingError || !existing) {
       console.error("Error al leer el envío existente:", existingError?.message);
@@ -136,41 +161,67 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    // status === "failed": reintento seguro, reutilizando la misma fila.
-    // Si no hay match de ownership, la función devuelve una fila con todos
-    // los campos en null (no un valor JS null) — hay que chequear .id, no
-    // la sola presencia del objeto.
-    const { data: retried, error: retryError } = await supabase.rpc("set_alert_status", {
-      p_alert_id: existing.id,
-      p_status: "pending",
-      p_error_message: null,
-    });
-    if (retryError || !retried?.id) {
-      console.error("Error al reintentar el envío:", retryError?.message);
+    // status === "failed": reintento seguro vía compare-and-set. Solo
+    // transiciona si el estado sigue siendo exactamente "failed" en el
+    // momento del UPDATE — si otra request ya la reclamó (ganó la carrera
+    // entre el SELECT de arriba y este UPDATE), esta consulta afecta 0
+    // filas y respondemos 409 en vez de mandar un segundo email.
+    const { data: retried, error: retryError } = await admin
+      .from("alerts_sent")
+      .update({ status: "pending", error_message: null })
+      .eq("id", existing.id)
+      .eq("status", "failed")
+      .select("id")
+      .maybeSingle<{ id: string }>();
+
+    if (retryError) {
+      console.error("Error al reintentar el envío:", retryError.message);
       res.status(500).json({ error: GENERIC_ERROR });
       return;
     }
-    alertId = existing.id;
+    if (!retried) {
+      // Alguien más ganó la transición failed -> pending justo antes.
+      res.status(409).json({ error: "Ya hay un envío en curso para este contacto y este análisis." });
+      return;
+    }
+    alertId = retried.id;
   } else {
     alertId = claimed.id;
   }
 
   try {
-    await sendAlertEmail({
-      to: contact.email,
-      contactName: contact.nombre,
-      riskLevel: check.risk_level,
-      signals: Array.isArray(check.signals) ? (check.signals as string[]) : [],
-      explanation: check.explanation,
-      recommendedAction: check.recommended_action,
-    });
+    // idempotencyKey = el UUID de la propia alerta: estable en todos los
+    // reintentos de esta misma fila, namespaced por diseño (una alerta =
+    // un check + un contacto, ya garantizado por el unique constraint).
+    await sendAlertEmail(
+      {
+        to: contact.email,
+        contactName: contact.nombre,
+        riskLevel: check.risk_level,
+        signals: Array.isArray(check.signals) ? (check.signals as string[]) : [],
+        explanation: check.explanation,
+        recommendedAction: check.recommended_action,
+      },
+      alertId,
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await supabase.rpc("set_alert_status", {
-      p_alert_id: alertId,
-      p_status: "failed",
-      p_error_message: message.slice(0, 300),
-    });
+
+    // pending -> failed, condicional: si por algún motivo el estado ya no
+    // es "pending" (no debería pasar en este punto, pero no confiamos a
+    // ciegas), no pisamos lo que haya quedado.
+    const { data: markedFailed, error: markFailedError } = await admin
+      .from("alerts_sent")
+      .update({ status: "failed", error_message: message.slice(0, 300) })
+      .eq("id", alertId)
+      .eq("status", "pending")
+      .select("id")
+      .maybeSingle<{ id: string }>();
+    if (markFailedError) {
+      console.error("No se pudo marcar la alerta como 'failed':", markFailedError.message);
+    } else if (!markedFailed) {
+      console.error("La alerta ya no estaba en 'pending' al intentar marcarla 'failed' (id:", alertId, ")");
+    }
 
     if (err instanceof ResendConfigError) {
       res.status(500).json({ error: err.message });
@@ -185,16 +236,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const { error: finalizeError } = await supabase.rpc("set_alert_status", {
-    p_alert_id: alertId,
-    p_status: "sent",
-    p_error_message: null,
-  });
-  if (finalizeError) {
-    // El email ya salió; si esto falla solo queda desalineado el estado en
-    // la base (podría reintentarse manualmente más adelante), pero no tiene
-    // sentido informarle un error al usuario por esto.
-    console.error("El email se envió pero no se pudo marcar como 'sent':", finalizeError.message);
+  // pending -> sent, condicional. Si esto no afecta ninguna fila, el estado
+  // quedó inconsistente con lo que esperábamos (no debería pasar dado que
+  // solo esta request tenía la alerta en "pending") — no confirmamos
+  // "sent" al cliente sin esa garantía.
+  const { data: markedSent, error: markSentError } = await admin
+    .from("alerts_sent")
+    .update({ status: "sent", sent_at: new Date().toISOString(), error_message: null })
+    .eq("id", alertId)
+    .eq("status", "pending")
+    .select("id")
+    .maybeSingle<{ id: string }>();
+
+  if (markSentError || !markedSent) {
+    console.error(
+      "El email se envió pero no se pudo confirmar el estado 'sent' de forma consistente:",
+      markSentError?.message ?? "(0 filas afectadas)",
+    );
+    res.status(500).json({ error: GENERIC_ERROR });
+    return;
   }
 
   res.status(200).json({ status: "sent" });
