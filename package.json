@@ -14,10 +14,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@getbrevo/brevo": "^6.0.3",
     "@supabase/supabase-js": "^2.112.3",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "resend": "^6.20.0"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

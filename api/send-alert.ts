@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { requireAuth, respondToAuthError, createUserScopedClient, type AuthenticatedUser } from "./_lib/auth.js";
 import { createAdminClient, AdminConfigError } from "./_lib/supabaseAdmin.js";
-import { sendAlertEmail, ResendConfigError, ResendSendError } from "./_lib/resend.js";
+import { sendAlertEmail, EmailConfigError, EmailSendError } from "./_lib/brevo.js";
 import type { RiskLevel } from "../shared/classifierContract.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -193,7 +193,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // idempotencyKey = el UUID de la propia alerta: estable en todos los
     // reintentos de esta misma fila, namespaced por diseño (una alerta =
     // un check + un contacto, ya garantizado por el unique constraint).
-    await sendAlertEmail(
+    const messageId = await sendAlertEmail(
       {
         to: contact.email,
         contactName: contact.nombre,
@@ -204,6 +204,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       alertId,
     );
+    // Brevo no ofrece idempotencia real en este endpoint (ver
+    // api/_lib/brevo.ts) — se loguea el messageId devuelto, junto con el id
+    // de la alerta, para poder reconciliar manualmente contra el dashboard
+    // de Brevo si hiciera falta.
+    console.log("Brevo aceptó el envío. alertId:", alertId, "messageId:", messageId);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
 
@@ -223,11 +228,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.error("La alerta ya no estaba en 'pending' al intentar marcarla 'failed' (id:", alertId, ")");
     }
 
-    if (err instanceof ResendConfigError) {
+    if (err instanceof EmailConfigError) {
       res.status(500).json({ error: err.message });
       return;
     }
-    if (err instanceof ResendSendError) {
+    if (err instanceof EmailSendError) {
       res.status(502).json({ error: "No se pudo enviar el email en este momento. Probá de nuevo en unos minutos." });
       return;
     }

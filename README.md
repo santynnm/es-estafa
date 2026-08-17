@@ -275,9 +275,17 @@ cliente.
 ## Persistencia de análisis y alertas por email (Día 7A)
 
 Esta etapa agrega el backend para guardar cada análisis y, para riesgo medio/alto, poder
-avisarle a un contacto familiar por email vía [Resend](https://resend.com). **Todavía no
-hay botón en la interfaz** — el flujo se probó por API; el botón "Avisarle a un familiar"
-es el Día 7B.
+avisarle a un contacto familiar por email vía [Brevo](https://www.brevo.com) (plan
+transaccional gratuito). **Todavía no hay botón en la interfaz** — el flujo se probó por
+API; el botón "Avisarle a un familiar" es el Día 7B.
+
+**Corrección 7A.1**: el proveedor de email original era Resend. Se reemplazó por Brevo
+porque, sin comprar/verificar un dominio propio, el remitente de prueba de Resend
+(`onboarding@resend.dev`) solo puede entregar al email con el que se creó la cuenta de
+Resend — no a un contacto familiar arbitrario. Brevo permite verificar un remitente
+individual (sin dominio) que sí entrega a cualquier destinatario, dentro de su plan
+gratuito (300 emails/día). El resto de las garantías de esta sección (RLS,
+`SUPABASE_SERVICE_ROLE_KEY`, compare-and-set en `alerts_sent`) no cambió.
 
 ### Privacidad de los análisis persistidos
 
@@ -339,7 +347,7 @@ mismo JWT que usa el servidor es el mismo que tiene el usuario. Por eso:
 - Todas las escrituras (crear la fila `pending`, pasar a `sent`/`failed`, reintentar un
   `failed`) las hace `api/send-alert.ts` con un cliente **service role** (ver
   `SUPABASE_SERVICE_ROLE_KEY` más abajo), que bypassea RLS por diseño. La única llave que
-  puede confirmar de verdad un envío es `RESEND_API_KEY`, y esa nunca sale del backend.
+  puede confirmar de verdad un envío es `BREVO_API_KEY`, y esa nunca sale del backend.
 - Como el cliente service role ignora RLS, la integridad de "quién es dueño de qué" se
   garantiza con **foreign keys compuestas**, no con políticas: `alerts_sent` tiene
   `foreign key (check_id, user_id) references checks (id, user_id)` y
@@ -383,7 +391,7 @@ recomendada) se recupera de Supabase con la sesión del usuario — nunca se con
 valor mandado por el cliente para esos campos. Verifica que el análisis y el contacto
 sean del usuario autenticado (si no, `404` genérico, sin distinguir "no existe" de "es de
 otra cuenta"), y que el riesgo sea `medio` o `alto` (si es `bajo`, `422`, sin llamar a
-Resend). El email es texto plano (nombre del contacto, nivel, señales, explicación,
+Brevo). El email es texto plano (nombre del contacto, nivel, señales, explicación,
 acción recomendada y el disclaimer de siempre) — nunca el `raw_text` completo, ni
 tokens, ni la imagen original.
 
@@ -391,7 +399,7 @@ tokens, ni la imagen original.
 (`check_id`, `contact_id`) inserta una fila `pending`, protegida por el `unique` de la
 tabla — si dos requests llegan casi al mismo tiempo, la base solo deja pasar un `INSERT`,
 la otra recibe automáticamente el conflicto (`23505`) y el endpoint responde `409`. Si ya
-está `sent`, también `409`. Si quedó `failed` (por ejemplo, un error temporal de Resend),
+está `sent`, también `409`. Si quedó `failed` (por ejemplo, un error temporal de Brevo),
 el reintento hace `UPDATE ... SET status = 'pending' WHERE id = ... AND status = 'failed'`
 — es decir, **solo transiciona si el estado seguía siendo exactamente `failed`** en el
 momento del `UPDATE`. Postgres serializa los `UPDATE` concurrentes sobre la misma fila: si
@@ -404,47 +412,67 @@ se verifica que haya afectado exactamente una fila antes de confiar en el result
 confirmación final a `sent` no puede aplicarse de forma consistente, el endpoint responde
 `500` en vez de devolver `{ "status": "sent" }` sin esa garantía.
 
-**Idempotencia en Resend**: cada llamada a `resend.emails.send()` incluye
-`{ idempotencyKey: alertId }` (el UUID de la fila de `alerts_sent`, vía el segundo
-parámetro `CreateEmailRequestOptions` del SDK — confirmado contra los tipos instalados,
-`node_modules/resend/dist/index.d.mts`), enviado como header `Idempotency-Key`. Como el
-`alertId` es siempre el mismo en todos los reintentos de una misma alerta (nunca se crea
-una fila nueva para un reintento), esto evita un segundo email real si Resend aceptó el
-envío pero se perdió la respuesta, o si el endpoint se reintenta tras un timeout — Resend
-devuelve el mismo `id` de email para la misma `idempotencyKey` en vez de crear uno nuevo.
-**Resend mantiene esta deduplicación durante 24 horas** desde el primer uso de la clave;
-pasado ese margen, un reintento con la misma clave ya no está garantizado como duplicado
-(ver [docs de Resend](https://resend.com/docs/dashboard/emails/idempotency-keys)) — un
-reintento manual más de un día después de un fallo original podría generar un email
-nuevo, algo razonable para este caso de uso.
+**Idempotencia — Brevo NO la garantiza para este endpoint (hallazgo verificado, no
+simulado)**: se investigó tanto la documentación oficial como los tipos instalados del
+SDK (`node_modules/@getbrevo/brevo/dist/cjs/api/resources/transactionalEmails/client/requests/SendTransacEmailRequest.d.ts`)
+antes de asumir nada. El endpoint de envío individual
+(`transactionalEmails.sendTransacEmail()`, el que usa esta app) **no tiene un parámetro
+de idempotencia real a nivel de API**. Su campo `headers?: Record<string, unknown>`
+documenta un ejemplo `{"Idempotency-Key": "abc-123"}`, pero es un **header MIME de
+salida cosmético** — se adjunta al email, no deduplica nada del lado de Brevo. Esto se
+confirmó empíricamente: dos llamadas directas a `sendAlertEmail()` con la misma
+`idempotencyKey` devolvieron dos `messageId` distintos (dos emails reales enviados), no
+uno. (Brevo sí documenta una idempotencia real de 30 minutos, pero es específica del
+envío por **lotes** vía `messageVersions` — una función que esta app no usa, porque cada
+alerta tiene un único destinatario por llamada.)
+
+Por eso, siguiendo la instrucción explícita de no simular una garantía que el proveedor
+no ofrece: **la única protección real contra duplicados sigue siendo el compare-and-set
+en Postgres** descrito arriba (el `unique(check_id, contact_id)` + las transiciones
+condicionales de `status`), que no depende de Brevo en absoluto y ya se verificó con
+carreras reales (`Promise.all` con dos requests simultáneas sobre la misma alerta
+`failed`: una gana con `200`, la otra recibe `409`, y solo se dispara un email). El
+`messageId` que devuelve Brevo en cada envío exitoso se loguea server-side (junto al
+`alertId`) para poder reconciliar manualmente contra el dashboard de Brevo si hiciera
+falta — no se persiste en la base porque el esquema de `alerts_sent` no tiene una
+columna para eso y agregarla está fuera del alcance de esta corrección. Igual se manda
+el header `Idempotency-Key` en cada request (sin costo ni efecto dañino), por si Brevo
+llega a extender la deduplicación real a este endpoint en el futuro.
 
 Respuestas: `401` sin sesión · `400` ids con formato inválido · `404` análisis o contacto
 inexistente/ajeno · `409` ya enviado o en curso (incluye la carrera perdida en un
 reintento) · `422` riesgo bajo · `500` config faltante, inconsistencia de estado o error
-interno · `502` Resend rechazó el envío.
+interno · `502` Brevo rechazó el envío.
 
-### Configurar Resend
+### Configurar Brevo
 
-1. Creá una cuenta gratuita en [resend.com](https://resend.com) y generá una API key en
-   **API Keys** (alcanza con una key restringida a "solo enviar").
-2. Sin un dominio propio verificado, usá el remitente de prueba
-   `onboarding@resend.dev` como `RESEND_FROM_EMAIL` — con ese remitente, Resend solo
-   entrega al email con el que te registraste en la cuenta (no a cualquier destinatario).
-   Para mandar a cualquier contacto real hace falta verificar un dominio propio en
-   **Domains** y usar una dirección de ese dominio.
-3. Cargá `RESEND_API_KEY` y `RESEND_FROM_EMAIL` en `.env` (ver `.env.example`) y, para
-   producción, en Vercel (**Settings → Environment Variables**).
+1. Creá una cuenta gratuita en [brevo.com](https://www.brevo.com) (plan Free, sin tarjeta
+   ni plan pago) y verificá el número de teléfono si te lo pide (paso manual de Brevo,
+   no automatizable).
+2. Agregá un remitente propio en **Settings → Senders, Domains & Dedicated IPs → Add a
+   sender** con un email real que controles, y confirmá el código que Brevo manda a esa
+   casilla. Sin un dominio propio autenticado (DKIM/SPF), la entregabilidad **no es
+   equivalente a la de un dominio propio** — puede haber más probabilidad de que el email
+   caiga en spam; no se compró ni registró ningún dominio como parte de esta corrección.
+3. Generá una API key en **Settings → SMTP & API → API Keys → Generate a new API key**.
+4. **IPs autorizadas**: por defecto Brevo puede exigir que las llamadas a la API vengan
+   de una IP autorizada (**Settings → Security → Authorised IPs**). Las funciones
+   serverless de Vercel **no tienen una IP de salida fija** (se observaron al menos tres
+   IPs de egreso distintas entre invocaciones locales y de producción) — mantener esa
+   restricción activa bloquea el envío de forma intermitente e impredecible. Por eso hay
+   que **desactivar la restricción de IP** en esa pantalla (no alcanza con ir agregando
+   IPs una por una). La única protección de la API key queda entonces la propia key
+   (nunca expuesta al cliente), igual que con la mayoría de proveedores de email
+   transaccional.
+5. Cargá `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` y `BREVO_SENDER_NAME` en `.env` (ver
+   `.env.example`) y, para producción, en Vercel (**Settings → Environment Variables**).
 
-**Estado actual (bloqueo externo real, sin resolver):** el proyecto **no tiene un dominio
-propio verificado en Resend**. Producción usa `onboarding@resend.dev`, que Resend
-restringe a entregar únicamente al email con el que se creó la cuenta de Resend — **no a
-un contacto familiar arbitrario**. El flujo funciona end-to-end (confirmado con envíos
-reales), pero solo puede demostrarse con ese único destinatario hasta que se verifique un
-dominio propio en **Resend → Domains** (agregar registros DNS del dominio elegido). No se
-compró ni registró ningún dominio como parte de esta corrección — es una decisión que le
-corresponde al usuario del proyecto, no algo para resolver unilateralmente. Una vez
-verificado un dominio, alcanza con actualizar `RESEND_FROM_EMAIL` a una dirección de ese
-dominio (en `.env` y en Vercel) y volver a desplegar; el resto del código no cambia.
+**Estado actual**: a diferencia de Resend (bloqueado a un único destinatario sin
+dominio), el remitente verificado individualmente en Brevo **sí entrega a cualquier
+destinatario real**, confirmado con envíos de riesgo medio y alto tanto en local como en
+producción (`https://codercup.vercel.app`), a una dirección distinta de la cuenta
+propietaria de Brevo. La limitación de entregabilidad (sin dominio propio autenticado)
+sigue siendo real y queda documentada arriba.
 
 ### Probar un envío real manualmente
 
