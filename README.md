@@ -272,6 +272,125 @@ cliente.
 5. Repetí el mismo intento con `.delete()` en vez de `.select()`: tiene que devolver
    `data: []` (cero filas afectadas), y el contacto de A tiene que seguir existiendo.
 
+## Persistencia de análisis y alertas por email (Día 7A)
+
+Esta etapa agrega el backend para guardar cada análisis y, para riesgo medio/alto, poder
+avisarle a un contacto familiar por email vía [Resend](https://resend.com). **Todavía no
+hay botón en la interfaz** — el flujo se probó por API; el botón "Avisarle a un familiar"
+es el Día 7B.
+
+### Privacidad de los análisis persistidos
+
+Desde esta etapa, los análisis (`raw_text` normalizado, `source_type`, y el resultado del
+clasificador) se guardan en la tabla `checks`, asociados al usuario que los generó. Son
+**privados**, protegidos por RLS igual que los contactos familiares (sección 12 de
+`indicaciones.md`): cada usuario solo puede ver los suyos, nadie más. Para capturas de
+pantalla, **nunca se guarda la imagen** — solo el `raw_text` ya extraído por OCR, el mismo
+texto que ya le llega al clasificador.
+
+### Esquema (`checks`)
+
+| Columna | Tipo | Notas |
+|---|---|---|
+| `id` | `uuid` | PK, `gen_random_uuid()` |
+| `user_id` | `uuid` | FK a `auth.users(id)`, `on delete cascade` |
+| `source_type` | `text` | `text` \| `image_ocr` \| `audio_transcript` (reservado, sin implementar) |
+| `raw_text` | `text` | no vacío, máx. 6000 caracteres (mismo límite que `/api/analyze`) |
+| `risk_level` | `text` | `bajo` \| `medio` \| `alto` |
+| `signals` | `jsonb` | array (mismo array del contrato del clasificador) |
+| `explanation` | `text` | no vacío |
+| `recommended_action` | `text` | no vacío |
+| `created_at` | `timestamptz` | default `now()` |
+
+RLS: `checks_select_own` e `checks_insert_own`, ambas `auth.uid() = user_id`. Sin política
+de `update`/`delete` — en esta etapa los análisis persistidos son de solo lectura una vez
+creados (no hay edición ni historial visible todavía).
+
+### Esquema (`alerts_sent`)
+
+| Columna | Tipo | Notas |
+|---|---|---|
+| `id` | `uuid` | PK |
+| `user_id` | `uuid` | FK a `auth.users(id)` |
+| `check_id` | `uuid` | FK a `checks(id)` |
+| `contact_id` | `uuid` | FK a `family_contacts(id)` |
+| `status` | `text` | `pending` \| `sent` \| `failed` |
+| `error_message` | `text` | detalle solo cuando `status = 'failed'` |
+| `sent_at` | `timestamptz` | seteado solo al pasar a `sent` |
+| `created_at` | `timestamptz` | |
+
+`unique (check_id, contact_id)`: como máximo una alerta por combinación
+análisis+contacto — es la base de la idempotencia (ver abajo).
+
+RLS: `alerts_sent_select_own` y `alerts_sent_insert_own_pending` (esta última solo permite
+insertar con `status = 'pending'`). **No hay política de `update` para nadie** — ni
+siquiera el dueño puede hacer `UPDATE` directo sobre la tabla. La única forma de pasar a
+`sent` o `failed` es la función `set_alert_status(alert_id, status, error_message)`
+(`security definer`, definida en la migración), que igual exige `auth.uid() = user_id`
+internamente antes de tocar la fila. Esto es lo que impide que un cliente marque
+arbitrariamente una alerta como enviada sin pasar por el envío real — la única llave que
+lo puede confirmar de verdad es `RESEND_API_KEY`, que el navegador nunca tiene.
+
+### `/api/analyze` — persistencia
+
+Después de que Gemini devuelve un resultado válido, se guarda en `checks` usando el
+**token del propio usuario** (no una service role key), así RLS sigue siendo la barrera
+real. El `body` de la respuesta sigue siendo exactamente el contrato del clasificador —
+sin `check_id` adentro — y el id de la fila creada viaja en el header **`X-Check-ID`**. Si
+falla el guardado, el endpoint no devuelve el resultado como si estuviera disponible para
+alertar: responde `502`.
+
+### `POST /api/send-alert`
+
+Protegido con `requireAuth()`. Recibe únicamente:
+
+```json
+{ "check_id": "uuid", "contact_id": "uuid" }
+```
+
+Todo lo demás (email destinatario, nivel de riesgo, señales, explicación, acción
+recomendada) se recupera de Supabase con la sesión del usuario — nunca se confía en un
+valor mandado por el cliente para esos campos. Verifica que el análisis y el contacto
+sean del usuario autenticado (si no, `404` genérico, sin distinguir "no existe" de "es de
+otra cuenta"), y que el riesgo sea `medio` o `alto` (si es `bajo`, `422`, sin llamar a
+Resend). El email es texto plano (nombre del contacto, nivel, señales, explicación,
+acción recomendada y el disclaimer de siempre) — nunca el `raw_text` completo, ni
+tokens, ni la imagen original.
+
+**Idempotencia**: la primera request para un par (`check_id`, `contact_id`) inserta una
+fila `pending`, protegida por el `unique` de la tabla — si dos requests llegan casi al
+mismo tiempo, la base solo deja pasar un `INSERT`, la otra recibe automáticamente el
+conflicto y el endpoint responde `409`. Si ya está `sent`, también `409`. Si quedó
+`failed` (por ejemplo, un error temporal de Resend), se puede reintentar: esa misma
+request reutiliza la fila existente en vez de crear una nueva.
+
+Respuestas: `401` sin sesión · `400` ids con formato inválido · `404` análisis o contacto
+inexistente/ajeno · `409` ya enviado o en curso · `422` riesgo bajo · `500` config faltante
+o error interno · `502` Resend rechazó el envío.
+
+### Configurar Resend
+
+1. Creá una cuenta gratuita en [resend.com](https://resend.com) y generá una API key en
+   **API Keys** (alcanza con una key restringida a "solo enviar").
+2. Sin un dominio propio verificado, usá el remitente de prueba
+   `onboarding@resend.dev` como `RESEND_FROM_EMAIL` — con ese remitente, Resend solo
+   entrega al email con el que te registraste en la cuenta (no a cualquier destinatario).
+   Para mandar a cualquier contacto real hace falta verificar un dominio propio en
+   **Domains** y usar una dirección de ese dominio.
+3. Cargá `RESEND_API_KEY` y `RESEND_FROM_EMAIL` en `.env` (ver `.env.example`) y, para
+   producción, en Vercel (**Settings → Environment Variables**).
+
+### Probar un envío real manualmente
+
+1. Analizá un texto que dé riesgo medio o alto (`POST /api/analyze` autenticado) y
+   guardate el header `X-Check-ID` de la respuesta.
+2. Agregá (o usá) un contacto familiar cuyo email puedas revisar vos.
+3. `POST /api/send-alert` con `{ "check_id": "...", "contact_id": "..." }` y el mismo
+   Bearer token.
+4. Revisá la bandeja de entrada de ese contacto — asunto, nivel de riesgo, señales,
+   explicación, acción recomendada y el disclaimer tienen que estar presentes, sin ningún
+   dato interno (tokens, claves, la imagen original).
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

@@ -7,7 +7,7 @@ import {
 } from "../shared/classifierContract.js";
 import { callGemini, GeminiError, InvalidGeminiResponseError } from "./_lib/gemini.js";
 import { respondToGeminiError } from "./_lib/httpErrors.js";
-import { requireAuth, respondToAuthError } from "./_lib/auth.js";
+import { requireAuth, respondToAuthError, createUserScopedClient, type AuthenticatedUser } from "./_lib/auth.js";
 
 const MAX_RAW_TEXT_LENGTH = 6000;
 
@@ -17,8 +17,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
+  let user: AuthenticatedUser;
   try {
-    await requireAuth(req);
+    user = await requireAuth(req);
   } catch (err) {
     if (respondToAuthError(res, err)) return;
     throw err;
@@ -69,6 +70,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       recommended_action: parsed.recommended_action,
     };
 
+    // Se persiste con el token del propio usuario (no con una service role
+    // key) para que RLS siga siendo la barrera real de acceso. Si falla el
+    // registro, no devolvemos el resultado como si estuviera disponible
+    // para alertar — sin fila en `checks` no hay check_id que referenciar
+    // después desde /api/send-alert.
+    const supabase = createUserScopedClient(user.accessToken);
+    const { data: inserted, error: insertError } = await supabase
+      .from("checks")
+      .insert({
+        user_id: user.id,
+        source_type,
+        raw_text,
+        risk_level: result.risk_level,
+        signals: result.signals,
+        explanation: result.explanation,
+        recommended_action: result.recommended_action,
+      })
+      .select("id")
+      .single();
+
+    if (insertError || !inserted) {
+      console.error("Error al registrar el análisis:", insertError?.message);
+      res.status(502).json({ error: "El análisis se generó pero no se pudo registrar. Probá de nuevo en unos segundos." });
+      return;
+    }
+
+    res.setHeader("X-Check-ID", inserted.id as string);
     res.status(200).json(result);
   } catch (err) {
     if (err instanceof InvalidGeminiResponseError) {
