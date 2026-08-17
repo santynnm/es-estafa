@@ -79,14 +79,24 @@ function isDuplicateParameterError(err: unknown): boolean {
 // generar un segundo email real — comportamiento verificado con envíos
 // reales, no asumido de la documentación.
 //
-// Pasado el TTL de 30 minutos, un reintento con la misma clave ya no está
-// garantizado como duplicado por Brevo y podría generar un email nuevo —
-// por eso esta idempotencia de proveedor es un complemento, no un
-// reemplazo, del compare-and-set en Postgres (api/send-alert.ts), que seguí
-// siendo la única barrera con garantía indefinida en el tiempo:
-// unique(check_id, contact_id) impide directamente que se cree una segunda
-// fila `pending` para el mismo par análisis+contacto, sin importar cuánto
-// haya pasado.
+// Pasado el TTL de 30 minutos, un reintento con la misma clave ya NO está
+// garantizado como duplicado por Brevo: si la fila sigue en `failed` (ver
+// api/send-alert.ts) y se reintenta después de ese margen, esta función
+// vuelve a llamar a sendTransacEmail con el mismo alertId y Brevo puede
+// aceptarlo como un envío nuevo — es una decisión deliberada del MVP
+// (política "al menos una vez": se prioriza poder reenviar una alerta
+// importante tras una falla temporal, aceptando el riesgo excepcional de
+// un email duplicado si la respuesta de Brevo fue ambigua). No hay
+// garantía de "exactamente una vez" para este caso. Lo que SÍ sigue siendo
+// cierto sin ventana de expiración es más acotado que "sin duplicados":
+// `unique(check_id, contact_id)` en `alerts_sent` impide que exista más de
+// una FILA para el mismo par análisis+contacto (nunca hay dos alertas
+// "en paralelo" para la misma combinación), y las transiciones
+// compare-and-set impiden que dos requests concurrentes ganen la misma
+// transición de estado. Ninguna de las dos evita que una única fila,
+// reintentada legítimamente después del TTL de Brevo, dispare un segundo
+// email real. Ver "Política de reintentos y garantía de entrega" en
+// README.md.
 export async function sendAlertEmail(params: AlertEmailParams, idempotencyKey: string): Promise<SendAlertEmailResult> {
   const apiKey = process.env.BREVO_API_KEY;
   const senderEmail = process.env.BREVO_SENDER_EMAIL;

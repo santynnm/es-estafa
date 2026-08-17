@@ -444,17 +444,58 @@ ejemplo `invalid_parameter`) sigue tratándose como un fallo genuino: `EmailSend
 
 **El TTL documentado por Brevo es de 30 minutos** desde el primer uso de la clave;
 pasado ese margen, un reintento con el mismo `idempotencyKey` ya no está garantizado
-como duplicado y podría generar un email nuevo. Por eso esta idempotencia de proveedor
-es un complemento, no un reemplazo, del **compare-and-set en Postgres** descrito arriba
-(el `unique(check_id, contact_id)` + las transiciones condicionales de `status`), que no
-depende de Brevo ni tiene ventana de expiración: sigue siendo la primera barrera contra
-duplicados, y ya se verificó con carreras reales (`Promise.all` con dos requests
-simultáneas sobre la misma alerta `failed`: una gana con `200`, la otra recibe `409`, y
-solo se dispara/reconfirma un email). El `messageId` que devuelve Brevo en cada envío
-exitoso, y la confirmación de `duplicate_parameter` en los reintentos, se loguean
-server-side junto al `alertId` para poder reconciliar manualmente contra el dashboard de
-Brevo si hiciera falta — no se persisten en la base porque el esquema de `alerts_sent`
-no tiene una columna para eso y agregarla está fuera del alcance de esta corrección.
+como duplicado y **podría generar un email nuevo**. El `messageId` que devuelve Brevo en
+cada envío exitoso, y la confirmación de `duplicate_parameter` en los reintentos, se
+loguean server-side junto al `alertId` para poder reconciliar manualmente contra el
+dashboard de Brevo si hiciera falta — no se persisten en la base porque el esquema de
+`alerts_sent` no tiene una columna para eso y agregarla está fuera del alcance de esta
+corrección. Ver la subsección siguiente para el detalle honesto de qué protege cada capa
+y qué no.
+
+### Política de reintentos y garantía de entrega (corrección 7A.1C)
+
+Este MVP **no ofrece una garantía de "exactamente una vez"** para el envío de alertas.
+La decisión explícita, para un proyecto sin capital para infraestructura adicional
+(colas, webhooks de confirmación, tablas de reconciliación), es priorizar poder
+reenviar una alerta importante después de una falla temporal por sobre eliminar por
+completo un riesgo excepcional y de bajo impacto (un email duplicado, no una pérdida de
+datos ni una brecha de seguridad). Concretamente, cada capa protege una cosa distinta,
+y ninguna por sí sola cubre todos los casos:
+
+- **`unique(check_id, contact_id)` en `alerts_sent`**: impide que exista más de una FILA
+  para la misma combinación análisis+contacto — no importa cuánto tiempo pase, nunca va a
+  haber dos alertas "en paralelo" para el mismo par. Esto es indefinido en el tiempo,
+  pero protege la unicidad de la fila, no la unicidad del email enviado a través de ella.
+- **Las transiciones compare-and-set** (`UPDATE ... WHERE status = '<esperado>'`):
+  garantizan que, ante dos requests concurrentes sobre la misma fila, exactamente una
+  gane cada transición de estado — la otra recibe `409` sin haber disparado un envío.
+  También indefinido en el tiempo, también acotado a la concurrencia, no al reintento.
+- **`headers.idempotencyKey` en Brevo**: deduplica reintentos del mismo `alertId` **solo
+  dentro de un TTL de 30 minutos** desde el primer uso de la clave (ver arriba). Pasado
+  ese margen, dejó de proteger.
+
+Los cuatro escenarios reales, verificados con envíos y compare-and-set reales:
+
+1. **Dos requests simultáneas** (mismo par análisis+contacto, cualquier estado
+   reintentable): una gana la transición y responde `200`, la otra recibe `409` — nunca
+   se disparan dos envíos.
+2. **Reintento de una alerta `failed`, dentro de los 30 minutos** de un envío que Brevo
+   ya había aceptado: Brevo responde `duplicate_parameter`, `api/send-alert.ts` lo
+   interpreta como ya confirmado y transiciona a `sent` — no se genera un segundo email.
+3. **Reintento de una alerta `failed`, después de los 30 minutos**: Brevo ya no puede
+   distinguir ese reintento de un envío nuevo y **puede aceptarlo como tal** — existe un
+   riesgo excepcional y aceptado de que el contacto reciba un email duplicado si el envío
+   original en realidad sí había sido entregado (por ejemplo, si Brevo lo aceptó pero la
+   aplicación no llegó a confirmar `sent` antes de que algo fallara). Es, en la
+   terminología estándar de sistemas distribuidos, una política de entrega **"al menos
+   una vez"**, no "exactamente una vez".
+4. **Alerta ya confirmada como `sent`**: nunca se vuelve a intentar — cualquier request
+   posterior para el mismo par análisis+contacto responde `409` de inmediato, sin llamar
+   a Brevo.
+
+Los límites de reintentos por usuario/globales (corrección 7A.2, todavía sin
+implementar) van a acotar cuántas veces puede ocurrir el escenario 3 en la práctica, pero
+no lo eliminan — ese es un límite de este MVP, documentado en vez de ocultado.
 
 Respuestas: `401` sin sesión · `400` ids con formato inválido · `404` análisis o contacto
 inexistente/ajeno · `409` ya enviado o en curso (incluye la carrera perdida en un
