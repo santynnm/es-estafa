@@ -543,6 +543,117 @@ sigue siendo real y queda documentada arriba.
    explicación, acción recomendada y el disclaimer tienen que estar presentes, sin ningún
    dato interno (tokens, claves, la imagen original).
 
+## Cupos diarios de email (corrección 7A.2A)
+
+Persistencia y operación atómica para limitar cuántos intentos de envío de alerta puede
+haber por día — **todavía no está conectada a `/api/send-alert`** (eso es la corrección
+7A.2B, después de auditar esta subetapa). Por ahora `POST /api/send-alert` sigue
+funcionando exactamente como en 7A.1C, sin ningún límite de cuota.
+
+### Límites
+
+- **5 intentos por usuario por día UTC.**
+- **250 intentos globales por día UTC** — entre todos los usuarios juntos. Deja un margen
+  de 50 respecto del límite gratuito de **300 emails/día** de Brevo, para dejar lugar a
+  reintentos legítimos de alertas `failed` fuera del TTL de idempotencia (ver la sección
+  "Política de reintentos y garantía de entrega" más arriba) sin arriesgarse a que Brevo
+  mismo empiece a rechazar por exceso de cuota.
+- El día se calcula **siempre server-side, en UTC**, a partir de `now()` dentro de la
+  función SQL — ningún caller, ni siquiera uno con la service role key, puede elegir qué
+  día se usa (la función no acepta ningún parámetro de fecha).
+
+### Qué cuenta como "intento" (para cuando 7A.2B la conecte)
+
+**Consume un intento**: cada llamada efectivamente hecha a
+`transactionalEmails.sendTransacEmail()` — exista éxito, un error genuino de Brevo, o un
+resultado `duplicate_parameter` (el proveedor sí recibió y procesó la solicitud, aunque
+sea para deduplicarla).
+
+**No consume un intento**: fallos de validación (`400`), sin sesión (`401`), análisis o
+contacto ajeno/inexistente (`404`), riesgo bajo (`422`), una alerta que ya está `sent` o
+`pending` (`409`), y una request que pierde el compare-and-set contra otra simultánea
+(`409`) — ninguno de esos casos llega a llamar a Brevo.
+
+### Esquema (`email_user_daily_usage`, `email_global_daily_usage`)
+
+| Tabla | Columnas | Notas |
+|---|---|---|
+| `email_user_daily_usage` | `user_id` (FK a `auth.users`, `on delete cascade`), `usage_date`, `attempt_count`, `updated_at` | PK `(user_id, usage_date)` — una fila por usuario y día UTC |
+| `email_global_daily_usage` | `usage_date`, `attempt_count`, `updated_at` | PK `usage_date` — una fila agregada por día UTC, sin referencia a ningún usuario |
+
+Ninguna de las dos tablas guarda emails, nombres, `raw_text` ni contenido del mensaje —
+solo contadores enteros por período.
+
+### Operación atómica (`reserve_email_attempt`)
+
+`reserve_email_attempt(p_user_id uuid)` reserva un intento o lo rechaza, en una única
+transacción implícita:
+
+1. Asegura y **bloquea** (`SELECT ... FOR UPDATE`) la fila de `email_user_daily_usage`
+   del usuario para hoy (UTC). **Siempre en este orden** — la fila de usuario primero,
+   la global después, nunca al revés — así ninguna invocación puede estar esperando el
+   lock que tiene otra ("orden de locking consistente" pedido en el enunciado): es
+   imposible que se forme un ciclo de espera entre dos llamadas.
+2. Si el contador individual ya está en 5, devuelve `user_limit` sin tocar la fila
+   global en absoluto.
+3. Si no, asegura y bloquea la fila de `email_global_daily_usage` de hoy.
+4. Si el contador global ya está en 250, devuelve `global_limit` sin haber incrementado
+   el individual (el chequeo de ambos límites siempre ocurre **antes** de incrementar
+   cualquiera de los dos).
+5. Si ninguno de los dos límites se superó, incrementa **los dos contadores juntos**, en
+   la misma transacción, y devuelve `reserved`.
+
+Devuelve siempre una fila `{ result, user_count, global_count }`, con `result` en
+`'reserved' | 'user_limit' | 'global_limit'`.
+
+**No usa `SECURITY DEFINER`**: el único rol que puede ejecutarla es `service_role` (ver
+grants abajo), que ya bypassea RLS por sí mismo — no hace falta escalar privilegios.
+Se deja en `SECURITY INVOKER` (el default) para minimizar superficie de ataque, con
+`search_path` fijado explícitamente (`public, pg_temp`) y todos los objetos calificados
+con `public.` de todas formas, como buena práctica.
+
+### Seguridad (defensa en profundidad)
+
+- RLS habilitado en ambas tablas, **sin ninguna política** para `anon` ni
+  `authenticated` — con RLS activo y cero políticas, ninguno de los dos roles puede leer
+  ni escribir ni una fila.
+- **Revocación explícita** de todos los privilegios de tabla para `PUBLIC`, `anon` y
+  `authenticated` (no alcanza con RLS solo: sin el `GRANT` subyacente tampoco pueden
+  emitir el comando en absoluto).
+- `EXECUTE` sobre `reserve_email_attempt` revocado de `PUBLIC`/`anon`/`authenticated` y
+  otorgado únicamente a `service_role`.
+- Nadie puede consultar su propio consumo ni, mucho menos, el agregado global, desde el
+  cliente — no hay ningún grant de lectura para `authenticated`. Si una etapa futura
+  necesita mostrarle a un usuario su propio consumo, se agregará explícitamente en otra
+  migración, nunca acceso al agregado global.
+- Verificado con clientes reales (no solo revisando las políticas): `anon` y un usuario
+  `authenticated` real reciben `42501 permission denied` tanto en `SELECT`/`INSERT`/
+  `UPDATE`/`DELETE` sobre ambas tablas como al invocar la RPC; `service_role` sí puede
+  ejecutarla.
+
+### Verificado con pruebas aisladas (sin gastar cuota real de Brevo ni contaminar el día real)
+
+Para probar límites y períodos sin tocar los contadores del día UTC real, se usó una
+función SQL temporal (`_test_reserve_email_attempt_for_date`, idéntica a
+`reserve_email_attempt` salvo por un parámetro de fecha explícito) creada, usada y
+**eliminada** dentro de la misma sesión de pruebas — nunca formó parte de ninguna
+migración ni quedó expuesta en producción. Con fechas de prueba fuera de cualquier rango
+real (`2000-01-0X`) y un segundo usuario de prueba (creado y borrado en la misma sesión):
+
+- 5 reservas secuenciales de un usuario → `reserved`; la 6ª → `user_limit`; contador
+  individual final: exactamente 5; contador global no se movió con el rechazo.
+- Contador global preparado en 249, dos reservas simultáneas de usuarios distintos →
+  exactamente una `reserved` y una `global_limit`; contador global final: exactamente
+  250; el que perdió por límite global no incrementó su contador individual.
+- Contador individual preparado en 4, dos reservas simultáneas del mismo usuario →
+  exactamente una `reserved` y una `user_limit`; contador individual final: exactamente
+  5; el que perdió por límite individual no incrementó el contador global.
+- Dos fechas UTC distintas para el mismo usuario mantienen contadores completamente
+  independientes.
+
+No se realizó ninguna llamada a Brevo durante esta verificación, ni se creó ninguna
+tabla, función o usuario que haya quedado después de terminar las pruebas.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`
