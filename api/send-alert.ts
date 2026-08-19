@@ -1,7 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireAuth, respondToAuthError, createUserScopedClient, type AuthenticatedUser } from "./_lib/auth.js";
 import { createAdminClient, AdminConfigError } from "./_lib/supabaseAdmin.js";
-import { sendAlertEmail, EmailConfigError, EmailSendError } from "./_lib/brevo.js";
+import { sendAlertEmail, assertEmailConfigured, EmailConfigError, EmailSendError } from "./_lib/brevo.js";
+import { reserveEmailAttempt, secondsUntilNextUtcMidnight } from "./_lib/emailQuota.js";
 import type { RiskLevel } from "../shared/classifierContract.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -29,6 +31,35 @@ interface ContactRow {
 interface AlertRow {
   id: string;
   status: string;
+}
+
+// pending -> failed, condicional: solo transiciona si el estado sigue
+// siendo exactamente "pending" en el momento del UPDATE. Se reutiliza en
+// los tres puntos donde una alerta ya reclamada ("pending") puede
+// necesitar volver a "failed" antes de llegar a Brevo (configuración
+// faltante, cupo agotado, error de la RPC de cupo) y también tras un error
+// real de Brevo — misma semántica compare-and-set que ya usaba
+// api/send-alert.ts, ahora en un solo lugar. Devuelve si la transición
+// realmente ocurrió (false si la fila ya no estaba en "pending" o si la
+// consulta falló) — el caller decide qué responder según ese resultado.
+async function markAlertFailed(admin: SupabaseClient, alertId: string, errorMessage: string): Promise<boolean> {
+  const { data, error } = await admin
+    .from("alerts_sent")
+    .update({ status: "failed", error_message: errorMessage.slice(0, 300) })
+    .eq("id", alertId)
+    .eq("status", "pending")
+    .select("id")
+    .maybeSingle<{ id: string }>();
+
+  if (error) {
+    console.error("No se pudo marcar la alerta como 'failed':", error.message);
+    return false;
+  }
+  if (!data) {
+    console.error("La alerta ya no estaba en 'pending' al intentar marcarla 'failed' (id:", alertId, ")");
+    return false;
+  }
+  return true;
 }
 
 // Envía una alerta por email a un contacto familiar para un análisis ya
@@ -189,10 +220,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     alertId = claimed.id;
   }
 
+  // Verificación de configuración ANTES de reservar cupo: si Brevo no está
+  // configurado, este intento no va a poder llegar a la API de todas
+  // formas — no tiene sentido gastar una unidad de cupo real por algo que
+  // ya sabemos que no va a intentarse.
+  try {
+    assertEmailConfigured();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await markAlertFailed(admin, alertId, message);
+    if (err instanceof EmailConfigError) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+    console.error("Error inesperado al verificar la configuración de email:", message);
+    res.status(500).json({ error: GENERIC_ERROR });
+    return;
+  }
+
+  // Reserva atómica de una unidad de cupo diario (5/usuario, 250 global,
+  // por día UTC — supabase/migrations/20260818134424_email_daily_usage.sql,
+  // verificada por scripts/eval-email-quota.mts). Un error de la RPC NUNCA
+  // se interpreta como "cupo agotado": es un error interno (500), distinto
+  // de un rechazo real por límite (429).
+  let quota;
+  try {
+    quota = await reserveEmailAttempt(admin, user.id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Error al reservar cupo de email:", message);
+    const markedFailed = await markAlertFailed(admin, alertId, "quota:reservation_error");
+    if (!markedFailed) {
+      console.error("Además, no se pudo marcar la alerta como 'failed' tras el error de reserva de cupo (id:", alertId, ")");
+    }
+    res.status(500).json({ error: GENERIC_ERROR });
+    return;
+  }
+
+  if (quota.status !== "reserved") {
+    // Cupo agotado (individual o global): la alerta reclamada vuelve a
+    // "failed" (no queda colgada en "pending"), sin haber llamado a Brevo
+    // ni una vez y sin haber gastado ninguna unidad de cupo adicional. Un
+    // reintento el mismo día UTC va a volver a pasar por acá y a recibir
+    // el mismo 429; al empezar un día UTC nuevo, reserve_email_attempt
+    // opera sobre un período distinto y el reintento puede prosperar.
+    const isUserLimit = quota.status === "user_limit";
+    const errorCode = isUserLimit ? "quota:user_daily_limit" : "quota:global_daily_limit";
+    const clientMessage = isUserLimit
+      ? "Alcanzaste el límite diario de alertas. Probá de nuevo mañana."
+      : "El servicio alcanzó el límite diario de alertas. Probá de nuevo mañana.";
+
+    const markedFailed = await markAlertFailed(admin, alertId, errorCode);
+    if (!markedFailed) {
+      // No simulamos un 429 "prolijo" sobre un estado que no pudimos
+      // confirmar — la alerta quedó en una situación inesperada (no
+      // debería pasar: nada más toca esta fila mientras sigue "pending"),
+      // así que respondemos 500 en vez de un 429 potencialmente engañoso.
+      console.error("No se pudo marcar 'failed' tras denegar cupo (id:", alertId, ") — respondiendo 500 en vez de 429.");
+      res.status(500).json({ error: GENERIC_ERROR });
+      return;
+    }
+
+    const retryAfterSeconds = secondsUntilNextUtcMidnight();
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+    res.status(429).json({ error: clientMessage });
+    return;
+  }
+
   try {
     // idempotencyKey = el UUID de la propia alerta: estable en todos los
     // reintentos de esta misma fila, namespaced por diseño (una alerta =
     // un check + un contacto, ya garantizado por el unique constraint).
+    //
+    // A partir de este punto la unidad de cupo reservada arriba queda
+    // consumida sin importar qué pase después (éxito, duplicate_parameter,
+    // error genuino, timeout o respuesta ambigua de Brevo) — no hay
+    // "reembolso": intentar una transacción distribuida entre Postgres y
+    // Brevo agregaría complejidad real para resolver un caso límite de bajo
+    // impacto. La única ventana inevitable es que, si el proceso se cae
+    // después de esta reserva pero antes de que la llamada a Brevo llegue a
+    // completarse (éxito o error), la unidad queda consumida sin que se
+    // haya mandado ningún email — documentado, no simulado como resuelto.
     const result = await sendAlertEmail(
       {
         to: contact.email,
@@ -218,22 +326,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-
-    // pending -> failed, condicional: si por algún motivo el estado ya no
-    // es "pending" (no debería pasar en este punto, pero no confiamos a
-    // ciegas), no pisamos lo que haya quedado.
-    const { data: markedFailed, error: markFailedError } = await admin
-      .from("alerts_sent")
-      .update({ status: "failed", error_message: message.slice(0, 300) })
-      .eq("id", alertId)
-      .eq("status", "pending")
-      .select("id")
-      .maybeSingle<{ id: string }>();
-    if (markFailedError) {
-      console.error("No se pudo marcar la alerta como 'failed':", markFailedError.message);
-    } else if (!markedFailed) {
-      console.error("La alerta ya no estaba en 'pending' al intentar marcarla 'failed' (id:", alertId, ")");
-    }
+    await markAlertFailed(admin, alertId, message);
 
     if (err instanceof EmailConfigError) {
       res.status(500).json({ error: err.message });

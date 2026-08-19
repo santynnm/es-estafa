@@ -65,6 +65,22 @@ function isDuplicateParameterError(err: unknown): boolean {
   return (body as { code?: unknown }).code === "duplicate_parameter";
 }
 
+// Preflight seguro: confirma que la configuración server-side de Brevo
+// está completa, SIN hacer ninguna llamada de red. Se llama desde
+// api/send-alert.ts antes de reservar cupo (para no gastar una unidad de
+// cupo si el envío ni siquiera va a poder intentarse), y también la usa
+// sendAlertEmail() acá abajo — cada una es una capa defensiva
+// independiente, ninguna reemplaza a la otra.
+export function assertEmailConfigured(): void {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  const senderName = process.env.BREVO_SENDER_NAME;
+  if (!apiKey || !senderEmail || !senderName) {
+    console.error("Falta configurar BREVO_API_KEY / BREVO_SENDER_EMAIL / BREVO_SENDER_NAME.");
+    throw new EmailConfigError("El servidor no está configurado correctamente para enviar alertas.");
+  }
+}
+
 // idempotencyKey: se reutiliza el UUID de la fila de alerts_sent (ver
 // api/send-alert.ts). Va como headers.idempotencyKey en el body de la
 // request — NO es un header HTTP de la llamada a la API ni tampoco (pese a
@@ -98,13 +114,13 @@ function isDuplicateParameterError(err: unknown): boolean {
 // email real. Ver "Política de reintentos y garantía de entrega" en
 // README.md.
 export async function sendAlertEmail(params: AlertEmailParams, idempotencyKey: string): Promise<SendAlertEmailResult> {
-  const apiKey = process.env.BREVO_API_KEY;
-  const senderEmail = process.env.BREVO_SENDER_EMAIL;
-  const senderName = process.env.BREVO_SENDER_NAME;
-  if (!apiKey || !senderEmail || !senderName) {
-    console.error("Falta configurar BREVO_API_KEY / BREVO_SENDER_EMAIL / BREVO_SENDER_NAME.");
-    throw new EmailConfigError("El servidor no está configurado correctamente para enviar alertas.");
-  }
+  // Validación defensiva propia — no depende de que el caller haya llamado
+  // assertEmailConfigured() antes; esta función nunca debe intentar
+  // construir el cliente de Brevo sin las tres variables presentes.
+  assertEmailConfigured();
+  const apiKey = process.env.BREVO_API_KEY!;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL!;
+  const senderName = process.env.BREVO_SENDER_NAME!;
 
   const client = new BrevoClient({ apiKey });
 

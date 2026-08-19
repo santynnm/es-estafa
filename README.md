@@ -543,12 +543,13 @@ sigue siendo real y queda documentada arriba.
    explicación, acción recomendada y el disclaimer tienen que estar presentes, sin ningún
    dato interno (tokens, claves, la imagen original).
 
-## Cupos diarios de email (corrección 7A.2A)
+## Cupos diarios de email (corrección 7A.2A, conectada en 7A.2B)
 
 Persistencia y operación atómica para limitar cuántos intentos de envío de alerta puede
-haber por día — **todavía no está conectada a `/api/send-alert`** (eso es la corrección
-7A.2B, después de auditar esta subetapa). Por ahora `POST /api/send-alert` sigue
-funcionando exactamente como en 7A.1C, sin ningún límite de cuota.
+haber por día. **Desde la corrección 7A.2B, `POST /api/send-alert` reserva cupo antes de
+cada llamada efectiva a Brevo** — ver la subsección "Integración con `/api/send-alert`"
+más abajo para el flujo completo, la semántica exacta de qué consume y qué no, y el
+comportamiento del `429`.
 
 ### Límites
 
@@ -562,17 +563,72 @@ funcionando exactamente como en 7A.1C, sin ningún límite de cuota.
   función SQL — ningún caller, ni siquiera uno con la service role key, puede elegir qué
   día se usa (la función no acepta ningún parámetro de fecha).
 
-### Qué cuenta como "intento" (para cuando 7A.2B la conecte)
+### Qué cuenta como "intento"
 
 **Consume un intento**: cada llamada efectivamente hecha a
 `transactionalEmails.sendTransacEmail()` — exista éxito, un error genuino de Brevo, o un
 resultado `duplicate_parameter` (el proveedor sí recibió y procesó la solicitud, aunque
 sea para deduplicarla).
 
-**No consume un intento**: fallos de validación (`400`), sin sesión (`401`), análisis o
-contacto ajeno/inexistente (`404`), riesgo bajo (`422`), una alerta que ya está `sent` o
-`pending` (`409`), y una request que pierde el compare-and-set contra otra simultánea
-(`409`) — ninguno de esos casos llega a llamar a Brevo.
+**No consume un intento**: método distinto de POST, sin sesión (`401`), ids con formato
+inválido (`400`), análisis o contacto ajeno/inexistente (`404`), riesgo bajo (`422`), una
+alerta que ya está `sent` o `pending` (`409`), una request que pierde el compare-and-set
+contra otra simultánea (`409`), configuración de Brevo faltante, y una reserva rechazada
+por límite individual o global (`429`) o por un error de la propia RPC de cupo (`500`) —
+ninguno de esos casos llega a llamar a Brevo.
+
+### Integración con `/api/send-alert` (corrección 7A.2B)
+
+`api/_lib/emailQuota.ts` encapsula la llamada a `reserve_email_attempt` a través del
+cliente admin (`api/_lib/supabaseAdmin.ts`, el mismo que ya usa `alerts_sent` — no se creó
+otro cliente service role) y valida estrictamente la respuesta antes de confiar en ella:
+exactamente una fila, `result` perteneciente a `reserved | user_limit | global_limit`, y
+los dos contadores como enteros no negativos (nunca se exponen al cliente ni a los logs
+más allá de esa validación). Un error de la RPC o una forma de respuesta inesperada
+**nunca** se interpreta como cupo agotado: se distingue con `QuotaReservationError`, que
+el endpoint trata como error interno (`500`), no como un `429`.
+
+`api/send-alert.ts` mantiene exactamente el flujo previo (auth → validar ids → leer
+check/contacto por RLS → rechazar riesgo bajo → reclamar/crear la fila de `alerts_sent`
+con INSERT + `unique(check_id, contact_id)` + compare-and-set) y agrega, **después** de
+reclamar la fila y **antes** de llamar a Brevo:
+
+1. `assertEmailConfigured()` (extraída de `api/_lib/brevo.ts`, que además conserva su
+   propia validación defensiva) — si falta configuración, la alerta pasa a `failed` sin
+   reservar cupo y sin llamar a Brevo, y el endpoint responde `500`.
+2. `reserveEmailAttempt(admin, user.id)` — reserva una unidad. Si el resultado no es
+   `reserved`, la alerta pasa a `failed` (compare-and-set, verificando que se modificó
+   exactamente una fila) con un `error_message` corto y sin datos personales
+   (`quota:user_daily_limit` o `quota:global_daily_limit`), y el endpoint responde:
+   - **`429`**, con el header **`Retry-After`** (segundos enteros hasta la próxima
+     medianoche UTC, calculados por `secondsUntilNextUtcMidnight()`: mínimo 1, máximo
+     86400 — nunca 0 ni negativo, nunca más de un día);
+   - un mensaje en español sin exponer contadores internos ni datos de Supabase/Brevo:
+     *"Alcanzaste el límite diario de alertas. Probá de nuevo mañana."* (individual) o
+     *"El servicio alcanzó el límite diario de alertas. Probá de nuevo mañana."* (global).
+   - Si la transición a `failed` no puede confirmarse (0 filas afectadas), el endpoint
+     **no** simula un `429` sobre un estado que no pudo verificar: responde `500`.
+3. Solo si el resultado es `reserved`, se llama una única vez a `sendAlertEmail()`. A
+   partir de ahí la unidad reservada queda **consumida sin importar el resultado**
+   (éxito, `duplicate_parameter`, error genuino, timeout o respuesta ambigua) — no hay
+   "reembolso": una transacción distribuida entre Postgres y Brevo agregaría complejidad
+   real para resolver un caso límite de bajo impacto. **Limitación documentada, no
+   resuelta**: si el proceso se cae después de reservar el cupo pero antes de que la
+   llamada a Brevo llegue a completarse, la unidad puede quedar consumida sin que se haya
+   mandado ningún email.
+
+Un reintento de una alerta `failed` por cupo agotado, dentro del mismo día UTC, vuelve a
+pasar por `reserveEmailAttempt` (vía `failed → pending`), recibe otra vez el mismo
+resultado (`user_limit`/`global_limit`) **sin** consumir una unidad nueva (el rechazo
+ocurre antes de tocar el contador que faltaba) y **sin** llamar a Brevo, y vuelve a
+`failed`. Al empezar un día UTC nuevo, `reserve_email_attempt` opera sobre un período
+distinto — el mismo reintento puede prosperar normalmente.
+
+`markAlertFailed()` (helper interno de `api/send-alert.ts`) centraliza la transición
+compare-and-set `pending → failed` que antes estaba duplicada inline — se reutiliza para
+configuración faltante, cupo agotado, error de la RPC de cupo, y error real de Brevo;
+misma semántica que ya tenía (`UPDATE ... WHERE status = 'pending'`, verificando una fila
+afectada), sin cambios de comportamiento.
 
 ### Esquema (`email_user_daily_usage`, `email_global_daily_usage`)
 
