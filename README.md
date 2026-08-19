@@ -654,6 +654,85 @@ real (`2000-01-0X`) y un segundo usuario de prueba (creado y borrado en la misma
 No se realizó ninguna llamada a Brevo durante esta verificación, ni se creó ninguna
 tabla, función o usuario que haya quedado después de terminar las pruebas.
 
+### Evaluación reproducible (corrección 7A.2A.1)
+
+La verificación manual de arriba quedó automatizada en `scripts/eval-email-quota.mts`,
+reutilizable como prueba de regresión de esta capa (incluso después de que 7A.2B la
+conecte a `/api/send-alert`).
+
+**Comando**:
+
+```bash
+npm run eval:quota
+```
+
+**Advertencia**: este script **no llama a Brevo, no envía emails, y no modifica los
+contadores reales de cupo** — todas las pruebas de límites y concurrencia corren dentro
+de un schema SQL aislado y descartable.
+
+**Variables requeridas** (ver `.env.example`):
+
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` — cliente `anon`, para las pruebas de
+  permisos.
+- `EVAL_USER_EMAIL`, `EVAL_USER_PASSWORD` — usuario `authenticated` real, mismas pruebas.
+- `SUPABASE_ACCESS_TOKEN` — Personal Access Token de Supabase (Management API). Se lee
+  **solo** de esta variable de entorno; el script nunca lo escribe a un archivo, nunca lo
+  imprime y nunca lo incluye en un mensaje de error. **Pasalo solo en memoria de tu
+  shell**, nunca en `.env` ni en ningún archivo del repo.
+- `SUPABASE_PROJECT_REF` — ref del proyecto (no es secreto).
+
+Si faltan `SUPABASE_ACCESS_TOKEN`/`SUPABASE_PROJECT_REF`, el script se detiene con un
+mensaje explícito y código de salida distinto de cero — nunca cae de vuelta a operar
+contra las tablas reales como alternativa.
+
+**Qué comprueba, en orden** (aborta antes de crear el schema aislado si el paso 1, 2 o 3
+falla):
+
+1. **La migración versionada no fue modificada**: compara el archivo actual contra el
+   contenido exacto del mismo archivo en el commit `9ec0081` (vía `git show`), no un hash
+   hardcodeado.
+2. **Invariantes textuales de la migración**: límites (5 / 250), los tres nombres de
+   resultado, orden de locking (usuario antes que global), exactamente dos `UPDATE` de
+   incremento, ausencia de `SECURITY DEFINER`, `search_path` fijado — sobre el texto sin
+   comentarios de línea (un comentario que *explica* por qué no se usa `SECURITY
+   DEFINER` contiene esa misma frase, así que compararlo tal cual daría un falso
+   positivo).
+3. **La función realmente desplegada coincide con la migración**: trae
+   `pg_get_functiondef` de `public.reserve_email_attempt` vía la Management API y lo
+   compara contra la migración con una normalización mecánica documentada en el propio
+   script — el **cuerpo** plpgsql se compara con espacios en blanco colapsados (Postgres
+   no reescribe el cuerpo, solo el encabezado), y el **encabezado** se compara por partes
+   semánticas (nombre+argumentos, columnas de retorno con sinónimos de tipo
+   normalizados como `int`→`integer`, `LANGUAGE`, ausencia de `SECURITY DEFINER`,
+   `search_path`), porque `pg_get_functiondef` reescribe la sintaxis del encabezado de
+   forma consistente pero no idéntica carácter a carácter (ej. `set x = y` →
+   `SET x TO 'y'`).
+4. **Permisos sobre los objetos reales**: `anon` y un usuario `authenticated` real
+   reciben `42501` en `SELECT`/`INSERT`/`UPDATE`/`DELETE` sobre ambas tablas y al invocar
+   la RPC (un rechazo de permisos no llega a ejecutar el cuerpo de la función, así que no
+   consume cupo real). `service_role` se verifica por catálogo
+   (`has_function_privilege`/`has_table_privilege`), **sin invocar la función** — así
+   tampoco consume una reserva real.
+5. **Pruebas funcionales dentro de un schema aislado** (`quota_eval_<16 hex aleatorios>`,
+   nombre validado con una regex estricta antes de interpolarlo en cualquier SQL, y
+   rechazado explícitamente si coincidiera con `public`/`auth`/`storage`/etc.): reproduce
+   fielmente la lógica de `reserve_email_attempt` (con dos diferencias documentadas y
+   deliberadas — sin FK a `auth.users`, para poder usar UUIDs ficticios sin crear
+   usuarios reales, y con un parámetro de fecha explícito, para poder probar distintos
+   "días" sin depender del reloj real). Corre los mismos cuatro escenarios que la
+   verificación manual (5 secuenciales + rechazo 6, carrera individual con contador en 4,
+   carrera global con contador en 249, períodos UTC independientes) más un `user_id`
+   nulo rechazado — **todas las carreras usan `Promise.all` sobre conexiones/requests
+   HTTP separadas a la Management API, nunca llamadas secuenciales simulando
+   concurrencia**.
+6. **Limpieza garantizada ante un fallo**: crea un segundo schema aislado, fuerza
+   deliberadamente un error justo después de crearlo, y confirma — desde afuera, con una
+   consulta a `pg_namespace` — que el bloque `finally` lo eliminó de todas formas.
+7. **Cero residuos**: confirma que no queda ningún schema `quota_eval_*` y que las
+   tablas reales (`email_user_daily_usage`, `email_global_daily_usage`) tienen
+   exactamente el mismo conteo de filas y la misma suma de `attempt_count` que tenían
+   antes de correr el script.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

@@ -11,6 +11,7 @@
     "typecheck": "tsc -b",
     "eval": "tsx scripts/eval-classifier.mts",
     "eval:image": "tsx scripts/eval-image-pipeline.mts",
+    "eval:quota": "tsx scripts/eval-email-quota.mts",
     "preview": "vite preview"
   },
   "dependencies": {
