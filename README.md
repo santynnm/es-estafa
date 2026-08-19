@@ -654,7 +654,7 @@ real (`2000-01-0X`) y un segundo usuario de prueba (creado y borrado en la misma
 No se realizó ninguna llamada a Brevo durante esta verificación, ni se creó ninguna
 tabla, función o usuario que haya quedado después de terminar las pruebas.
 
-### Evaluación reproducible (corrección 7A.2A.1)
+### Evaluación reproducible (corrección 7A.2A.1, endurecida en 7A.2A.2)
 
 La verificación manual de arriba quedó automatizada en `scripts/eval-email-quota.mts`,
 reutilizable como prueba de regresión de esta capa (incluso después de que 7A.2B la
@@ -685,18 +685,35 @@ Si faltan `SUPABASE_ACCESS_TOKEN`/`SUPABASE_PROJECT_REF`, el script se detiene c
 mensaje explícito y código de salida distinto de cero — nunca cae de vuelta a operar
 contra las tablas reales como alternativa.
 
-**Qué comprueba, en orden** (aborta antes de crear el schema aislado si el paso 1, 2 o 3
-falla):
+**Qué comprueba, en orden**:
 
+0. **Auto-test del propio mecanismo fail-fast, sobre copias EN MEMORIA del SQL** (nunca
+   toca el archivo): muta el límite individual (5→6), agrega `SECURITY DEFINER`, renombra
+   el resultado `user_limit`, e invierte el orden de locks (swap de nombres de tabla
+   dentro del cuerpo de la función) — y confirma que cada mutación es detectada por
+   `evaluateMigrationInvariants()`. Mientras corre este auto-test, `globalThis.fetch`
+   queda reemplazado por una versión que **tira una excepción si algo la invoca**, así
+   que un intento de red durante el auto-test lo hace fallar a él mismo, no solo lo deja
+   sin detectar. También confirma, como control de cordura, que el SQL real sin mutar
+   sigue pasando todas las invariantes.
 1. **La migración versionada no fue modificada**: compara el archivo actual contra el
    contenido exacto del mismo archivo en el commit `9ec0081` (vía `git show`), no un hash
    hardcodeado.
-2. **Invariantes textuales de la migración**: límites (5 / 250), los tres nombres de
-   resultado, orden de locking (usuario antes que global), exactamente dos `UPDATE` de
-   incremento, ausencia de `SECURITY DEFINER`, `search_path` fijado — sobre el texto sin
-   comentarios de línea (un comentario que *explica* por qué no se usa `SECURITY
-   DEFINER` contiene esa misma frase, así que compararlo tal cual daría un falso
-   positivo).
+2. **Invariantes textuales de la migración, fail-fast**: límites (5 / 250), los tres
+   nombres de resultado, orden de locking (usuario antes que global), exactamente dos
+   `UPDATE` de incremento, ausencia de `SECURITY DEFINER`, `search_path` fijado — sobre
+   el texto sin comentarios de línea (un comentario que *explica* por qué no se usa
+   `SECURITY DEFINER` contiene esa misma frase, así que compararlo tal cual daría un
+   falso positivo). `evaluateMigrationInvariants()` es una función **pura** (solo
+   operaciones de string, nunca red ni filesystem) que devuelve la lista completa de
+   chequeos; `assertMigrationInvariants()` los imprime y, si **cualquiera** falló, lanza
+   de inmediato — la decisión de abortar se toma sobre el array de resultados de esa
+   misma llamada, nunca sobre el contador global de fails/pass que se usa solo para el
+   resumen final. Los pasos 1 y 2 corren **antes de revisar si hay credenciales
+   configuradas**: si la migración está rota, no hace falta token para saberlo, y el
+   aborto ocurre antes de cualquier consulta o modificación a Supabase, antes de crear
+   el schema aislado, antes de tomar cualquier snapshot y antes de las pruebas de
+   permisos o concurrencia.
 3. **La función realmente desplegada coincide con la migración**: trae
    `pg_get_functiondef` de `public.reserve_email_attempt` vía la Management API y lo
    compara contra la migración con una normalización mecánica documentada en el propio
@@ -724,14 +741,29 @@ falla):
    carrera global con contador en 249, períodos UTC independientes) más un `user_id`
    nulo rechazado — **todas las carreras usan `Promise.all` sobre conexiones/requests
    HTTP separadas a la Management API, nunca llamadas secuenciales simulando
-   concurrencia**.
+   concurrencia**. Al final de este paso, un sub-paso 5.6 prueba el **comparador de
+   digests** (ver punto 7) dentro del mismo schema aislado: arma dos estados con la
+   misma fila (mismo conteo, mismo `attempt_count`) donde solo cambia `updated_at`, y
+   confirma que el digest sí lo detecta — sin este chequeo, un snapshot basado solo en
+   conteo/suma no vería ninguna diferencia.
 6. **Limpieza garantizada ante un fallo**: crea un segundo schema aislado, fuerza
    deliberadamente un error justo después de crearlo, y confirma — desde afuera, con una
    consulta a `pg_namespace` — que el bloque `finally` lo eliminó de todas formas.
-7. **Cero residuos**: confirma que no queda ningún schema `quota_eval_*` y que las
-   tablas reales (`email_user_daily_usage`, `email_global_daily_usage`) tienen
-   exactamente el mismo conteo de filas y la misma suma de `attempt_count` que tenían
-   antes de correr el script.
+7. **Cero residuos, con digest exacto de las tablas reales**: busca schemas residuales
+   con el patrón **exacto** `nspname ~ '^quota_eval_[0-9a-f]{16}$'` (nunca
+   `like 'quota_eval_%'`, que también matchearía cualquier nombre que solo empezara
+   parecido) y confirma que no hay ninguno. Compara además el estado de
+   `email_user_daily_usage`/`email_global_daily_usage` **antes y después** de toda la
+   corrida mediante un digest exacto — no solo cantidad de filas y suma de
+   `attempt_count` (eso no detectaría, por ejemplo, dos filas que intercambiaran su
+   `attempt_count` entre sí, o un `updated_at` alterado sin cambiar el conteo). El
+   digest se calcula **enteramente en SQL**: para cada tabla arma una representación
+   canónica de todas sus filas con sus columnas relevantes (clave primaria +
+   `attempt_count` + `updated_at`, este último normalizado con `extract(epoch from ...)`
+   para no depender del formato de serialización del timestamp), ordenada de forma
+   estable (`user_id, usage_date` / `usage_date`), y calcula `md5()` sobre esa
+   representación — así nunca sale de Supabase una fila cruda ni un UUID de usuario: lo
+   único que imprime el script es el conteo y el digest (opaco) de cada tabla.
 
 ## Límite del tier gratuito de Gemini (429)
 

@@ -122,20 +122,31 @@ function stripSqlLineComments(sql: string): string {
 // ---------------------------------------------------------------------
 // Paso 2: invariantes textuales esperados en la migración (límites,
 // nombres de resultado, orden de locking, incremento conjunto).
+//
+// evaluateMigrationInvariants() es una función PURA: solo hace
+// operaciones de string sobre el texto que recibe, nunca red ni
+// filesystem. Devuelve la lista completa de chequeos (con su resultado),
+// para que quien la llama decida qué hacer — no depende de ningún
+// contador global. Se reutiliza tal cual en dos lugares: el chequeo real
+// (assertMigrationInvariants, que imprime y aborta) y el auto-test local
+// de abajo (selfTestFailFast, que la corre sobre copias mutadas en
+// memoria para probar que el aborto realmente dispara).
 // ---------------------------------------------------------------------
-function checkMigrationInvariants(migrationSqlRaw: string) {
-  section("Paso 2: invariantes textuales de la migración");
+interface InvariantCheck {
+  label: string;
+  ok: boolean;
+  detail?: unknown;
+}
+
+function evaluateMigrationInvariants(migrationSqlRaw: string): InvariantCheck[] {
   const migrationSql = stripSqlLineComments(migrationSqlRaw);
+  const checks: InvariantCheck[] = [];
 
-  if (/v_user_count\s*>=\s*5/.test(migrationSql)) pass("límite individual = 5");
-  else fail("no se encontró el límite individual (>= 5)");
-
-  if (/v_global_count\s*>=\s*250/.test(migrationSql)) pass("límite global = 250");
-  else fail("no se encontró el límite global (>= 250)");
+  checks.push({ label: "límite individual = 5", ok: /v_user_count\s*>=\s*5/.test(migrationSql) });
+  checks.push({ label: "límite global = 250", ok: /v_global_count\s*>=\s*250/.test(migrationSql) });
 
   for (const name of ["reserved", "user_limit", "global_limit"]) {
-    if (migrationSql.includes(`'${name}'`)) pass(`nombre de resultado presente: ${name}`);
-    else fail(`falta el nombre de resultado: ${name}`);
+    checks.push({ label: `nombre de resultado presente: ${name}`, ok: migrationSql.includes(`'${name}'`) });
   }
 
   // Acota la búsqueda al cuerpo de la función (desde "create or replace
@@ -150,26 +161,145 @@ function checkMigrationInvariants(migrationSqlRaw: string) {
   // El SELECT ... FOR UPDATE de la fila global debe aparecer, en el texto,
   // después del FOR UPDATE de la fila de usuario (mismo orden que ejecuta
   // en tiempo de corrida, porque no hay ramas que inviertan ese orden).
-  if (
-    functionStartIdx !== -1 &&
-    userForUpdateIdx !== -1 &&
-    globalForUpdateIdx !== -1 &&
-    userForUpdateIdx < globalForUpdateIdx
-  ) {
-    pass("orden de locking: usuario antes que global (FOR UPDATE)");
-  } else {
-    fail("no se pudo confirmar el orden de locking usuario->global", { functionStartIdx, userForUpdateIdx, globalForUpdateIdx });
-  }
+  const lockOrderOk =
+    functionStartIdx !== -1 && userForUpdateIdx !== -1 && globalForUpdateIdx !== -1 && userForUpdateIdx < globalForUpdateIdx;
+  checks.push({
+    label: "orden de locking: usuario antes que global (FOR UPDATE)",
+    ok: lockOrderOk,
+    detail: lockOrderOk ? undefined : { functionStartIdx, userForUpdateIdx, globalForUpdateIdx },
+  });
 
   const updateMatches = migrationSql.match(/update public\.email_(user|global)_daily_usage[\s\S]*?attempt_count \+ 1/g) ?? [];
-  if (updateMatches.length === 2) pass("dos UPDATE de incremento (individual + global), no más ni menos");
-  else fail(`se esperaban exactamente 2 UPDATE de incremento, se encontraron ${updateMatches.length}`);
+  checks.push({
+    label: "dos UPDATE de incremento (individual + global), no más ni menos",
+    ok: updateMatches.length === 2,
+    detail: updateMatches.length === 2 ? undefined : `se encontraron ${updateMatches.length}`,
+  });
 
-  if (/security\s+definer/i.test(migrationSql)) fail("la migración usa SECURITY DEFINER (se esperaba SECURITY INVOKER)");
-  else pass("sin SECURITY DEFINER (SECURITY INVOKER por default)");
+  checks.push({ label: "sin SECURITY DEFINER (SECURITY INVOKER por default)", ok: !/security\s+definer/i.test(migrationSql) });
 
-  if (/set search_path\s*=\s*public\s*,\s*pg_temp/i.test(migrationSql)) pass("search_path fijado a (public, pg_temp)");
-  else fail("no se encontró el search_path esperado");
+  checks.push({ label: "search_path fijado a (public, pg_temp)", ok: /set search_path\s*=\s*public\s*,\s*pg_temp/i.test(migrationSql) });
+
+  return checks;
+}
+
+// Wrapper impuro: imprime cada chequeo y, si alguno falló, lanza de
+// inmediato — ANTES de que main() llegue a tocar Supabase (comparar la
+// función desplegada, crear el schema aislado, tomar snapshots, o correr
+// pruebas de permisos/concurrencia). La decisión de abortar se toma sobre
+// el array de resultados de ESTA llamada (variable local `failed`), no
+// sobre el contador global `failures` que usan pass()/fail() para el
+// resumen final.
+function assertMigrationInvariants(migrationSqlRaw: string): void {
+  section("Paso 2: invariantes textuales de la migración (fail-fast, sin red)");
+  const checks = evaluateMigrationInvariants(migrationSqlRaw);
+  for (const c of checks) {
+    if (c.ok) pass(c.label);
+    else fail(c.label, c.detail);
+  }
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length > 0) {
+    throw new Error(
+      `Abortando ANTES de contactar Supabase: ${failed.length} invariante(s) de la migración fallaron: ${failed.map((f) => f.label).join(", ")}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------
+// Paso 0: auto-test del propio mecanismo fail-fast. Muta EN MEMORIA
+// copias del texto de la migración real (nunca toca el archivo) y
+// confirma que evaluateMigrationInvariants() detecta cada mutación como
+// inválida — y que hacerlo no dispara ninguna llamada de red: mientras
+// corre este auto-test, se reemplaza globalThis.fetch por una versión que
+// tira una excepción si algo la invoca, así que cualquier intento de
+// red (accidental o no) hace fallar el auto-test mismo, no solo lo deja
+// sin detectar.
+// ---------------------------------------------------------------------
+function swapTableNamesInFunctionBody(sql: string): string {
+  const functionStartIdx = sql.indexOf("create or replace function");
+  const before = sql.slice(0, functionStartIdx);
+  const after = sql.slice(functionStartIdx);
+  const placeholder = "SWAP";
+  const swapped = after
+    .split("email_user_daily_usage")
+    .join(placeholder)
+    .split("email_global_daily_usage")
+    .join("email_user_daily_usage")
+    .split(placeholder)
+    .join("email_global_daily_usage");
+  return before + swapped;
+}
+
+interface Mutation {
+  label: string;
+  mutate: (sql: string) => string;
+  expectedKeyword: string;
+}
+
+const SELF_TEST_MUTATIONS: Mutation[] = [
+  {
+    label: "límite individual alterado de 5 a 6",
+    mutate: (sql) => sql.replace("v_user_count >= 5", "v_user_count >= 6"),
+    expectedKeyword: "límite individual",
+  },
+  {
+    label: "SECURITY DEFINER agregado a la función",
+    mutate: (sql) => sql.replace("language plpgsql\nset search_path", "language plpgsql\nsecurity definer\nset search_path"),
+    expectedKeyword: "SECURITY DEFINER",
+  },
+  {
+    label: "nombre de resultado 'user_limit' renombrado",
+    mutate: (sql) => sql.replace("'user_limit'::text", "'foo_limit'::text"),
+    expectedKeyword: "user_limit",
+  },
+  {
+    label: "orden de locks invertido (swap de nombres de tabla en el cuerpo de la función)",
+    mutate: swapTableNamesInFunctionBody,
+    expectedKeyword: "orden de locking",
+  },
+];
+
+async function selfTestFailFast(realMigrationSql: string): Promise<void> {
+  section("Paso 0: auto-test del mecanismo fail-fast (mutaciones en memoria, sin red)");
+
+  const originalFetch = globalThis.fetch;
+  let networkCallAttempted = false;
+  globalThis.fetch = (() => {
+    networkCallAttempted = true;
+    throw new Error("selfTestFailFast: se intentó una llamada de red durante el auto-test — no debería pasar nunca.");
+  }) as typeof fetch;
+
+  try {
+    for (const m of SELF_TEST_MUTATIONS) {
+      networkCallAttempted = false;
+      const mutated = m.mutate(realMigrationSql);
+      if (mutated === realMigrationSql) {
+        fail(`auto-test '${m.label}': la mutación no cambió nada (patrón no encontrado en el SQL real)`);
+        continue;
+      }
+      const checks = evaluateMigrationInvariants(mutated);
+      const failedLabels = checks.filter((c) => !c.ok).map((c) => c.label);
+      const detected = failedLabels.some((l) => l.includes(m.expectedKeyword));
+      if (failedLabels.length > 0 && detected) {
+        pass(`auto-test '${m.label}': detectada correctamente`, failedLabels);
+      } else {
+        fail(`auto-test '${m.label}': NO fue detectada como se esperaba`, failedLabels);
+      }
+      if (networkCallAttempted) {
+        fail(`auto-test '${m.label}': se intentó una llamada de red (no debería haber ninguna)`);
+      }
+    }
+
+    // Control de cordura: el SQL real (sin mutar) tiene que seguir
+    // pasando todas las invariantes — si esto fallara, sería un bug en
+    // evaluateMigrationInvariants(), no en la migración.
+    const realChecks = evaluateMigrationInvariants(realMigrationSql);
+    const realFailed = realChecks.filter((c) => !c.ok);
+    if (realFailed.length === 0) pass("el SQL real (sin mutar) pasa las invariantes — el evaluador no está siempre en falla");
+    else fail("el SQL real no debería fallar ninguna invariante (bug en el evaluador)", realFailed);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -393,19 +523,103 @@ async function checkPermissions(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------
-// Snapshot de las tablas reales — para confirmar, al final, que esta
-// evaluación no las tocó.
+// Snapshot con digest exacto — reemplaza el snapshot anterior (solo
+// conteo + suma de attempt_count), que no detectaría, por ejemplo, dos
+// filas que intercambiaran su attempt_count entre sí, o un updated_at
+// alterado sin cambiar el conteo. Para cada tabla se arma una
+// representación canónica de TODAS sus filas y columnas relevantes (clave
+// primaria + attempt_count + updated_at), en un orden estable
+// (user_id, usage_date para la individual; usage_date para la global), y
+// se calcula un md5 sobre esa representación — todo en SQL, así nunca
+// viaja a Node ni se imprime una fila cruda o un UUID: lo único que sale
+// de la consulta es el conteo y el digest, ambos opacos.
+//
+// updated_at se normaliza con extract(epoch from ...) para no depender de
+// cómo el servidor serialice un timestamptz a texto (evita falsos
+// positivos por formato, sin perder precisión real).
+//
+// schema es "public" (constante) para el snapshot real, o un nombre de
+// schema aislado ya validado por assertValidSchemaName cuando se reutiliza
+// esta misma función para el auto-test del comparador (ver
+// selfTestDigestComparator).
+function buildTableDigestQuery(schema: string): string {
+  if (schema !== "public") assertValidSchemaName(schema);
+  return `
+    select 'email_user_daily_usage' as table_name, count(*) as row_count,
+      md5(coalesce(string_agg(
+        user_id::text || '|' || usage_date::text || '|' || attempt_count::text || '|' || extract(epoch from updated_at)::text,
+        ';' order by user_id, usage_date
+      ), '')) as digest
+    from ${schema}.email_user_daily_usage
+    union all
+    select 'email_global_daily_usage', count(*),
+      md5(coalesce(string_agg(
+        usage_date::text || '|' || attempt_count::text || '|' || extract(epoch from updated_at)::text,
+        ';' order by usage_date
+      ), ''))
+    from ${schema}.email_global_daily_usage;
+  `;
+}
+
+interface TableDigest {
+  rowCount: number;
+  digest: string;
+}
+
+async function snapshotTables(schema: string): Promise<Record<string, TableDigest>> {
+  const rows = await runManagementQuery(buildTableDigestQuery(schema));
+  const result: Record<string, TableDigest> = {};
+  for (const r of rows) {
+    result[r.table_name] = { rowCount: Number(r.row_count), digest: r.digest as string };
+  }
+  return result;
+}
+
+function snapshotsEqual(a: Record<string, TableDigest>, b: Record<string, TableDigest>): boolean {
+  const tables = ["email_user_daily_usage", "email_global_daily_usage"];
+  return tables.every((t) => a[t]?.rowCount === b[t]?.rowCount && a[t]?.digest === b[t]?.digest);
+}
+
 // ---------------------------------------------------------------------
-async function snapshotRealTables(): Promise<{ userRows: number; globalRows: number; userSum: number; globalSum: number }> {
-  const rows = await runManagementQuery(`
-    select
-      (select count(*) from public.email_user_daily_usage) as user_rows,
-      (select coalesce(sum(attempt_count), 0) from public.email_user_daily_usage) as user_sum,
-      (select count(*) from public.email_global_daily_usage) as global_rows,
-      (select coalesce(sum(attempt_count), 0) from public.email_global_daily_usage) as global_sum;
-  `);
-  const r = rows[0];
-  return { userRows: Number(r.user_rows), userSum: Number(r.user_sum), globalRows: Number(r.global_rows), globalSum: Number(r.global_sum) };
+// Auto-test del comparador de digests, dentro del schema aislado (nunca
+// contra las tablas reales): arma dos estados con la MISMA cantidad de
+// filas — de hecho la misma fila — donde lo único que cambia es
+// updated_at (attempt_count y la clave primaria quedan iguales), y
+// confirma que el digest sí lo detecta. Reutiliza exactamente
+// buildTableDigestQuery()/snapshotTables(), así prueba el comparador
+// real, no una reimplementación paralela.
+// ---------------------------------------------------------------------
+async function selfTestDigestComparator(schema: string): Promise<void> {
+  section("Paso 5.6: auto-test del comparador de digests (mismo conteo, contenido distinto)");
+  const DIGEST_TEST_USER = "33333333-3333-4333-8333-333333333333";
+  const DIGEST_TEST_DATE = "2000-01-09";
+
+  await runManagementQuery(
+    `insert into ${schema}.email_user_daily_usage (user_id, usage_date, attempt_count, updated_at) ` +
+      `values ('${DIGEST_TEST_USER}'::uuid, '${DIGEST_TEST_DATE}'::date, 2, '2000-01-09T00:00:00Z'::timestamptz);`,
+  );
+  const stateA = await snapshotTables(schema);
+
+  // Mismo conteo de filas, mismo attempt_count (misma suma) — solo cambia
+  // updated_at. El snapshot anterior (conteo + suma) NO habría detectado
+  // esto; el digest sí tiene que hacerlo.
+  await runManagementQuery(
+    `update ${schema}.email_user_daily_usage set updated_at = '2000-01-09T00:00:05Z'::timestamptz ` +
+      `where user_id = '${DIGEST_TEST_USER}'::uuid and usage_date = '${DIGEST_TEST_DATE}'::date;`,
+  );
+  const stateB = await snapshotTables(schema);
+
+  const sameRowCount = stateA.email_user_daily_usage.rowCount === stateB.email_user_daily_usage.rowCount;
+  const differentDigest = stateA.email_user_daily_usage.digest !== stateB.email_user_daily_usage.digest;
+
+  if (sameRowCount) pass("mismo conteo de filas entre los dos estados (como se esperaba)");
+  else fail("el conteo de filas debería ser igual entre los dos estados", { stateA, stateB });
+
+  if (differentDigest) pass("el digest SÍ detecta el cambio de updated_at aunque el conteo no cambió", {
+    digestA: stateA.email_user_daily_usage.digest,
+    digestB: stateB.email_user_daily_usage.digest,
+  });
+  else fail("el digest debería haber cambiado tras modificar updated_at", stateA.email_user_daily_usage.digest);
 }
 
 // ---------------------------------------------------------------------
@@ -589,31 +803,43 @@ async function testCleanupOnForcedFailure(): Promise<void> {
 // Orquestación principal.
 // ---------------------------------------------------------------------
 async function main() {
-  console.log("Evaluación de cupos diarios de email — corrección 7A.2A.1");
+  console.log("Evaluación de cupos diarios de email — corrección 7A.2A.2");
   console.log("No llama a Brevo. No modifica las tablas reales de cupo. No envía emails.\n");
 
-  if (!SUPABASE_ACCESS_TOKEN || !SUPABASE_PROJECT_REF) {
-    console.error(
-      "BLOQUEADO: faltan SUPABASE_ACCESS_TOKEN y/o SUPABASE_PROJECT_REF.\n" +
-        "Sin esas variables no se puede comparar la función desplegada ni crear el schema\n" +
-        "aislado para las pruebas — no se va a usar ninguna alternativa insegura (como\n" +
-        "operar contra las tablas reales). Definilas solo en memoria de tu shell (nunca en\n" +
-        ".env ni en ningún archivo del repo) y volvé a correr `npm run eval:quota`.",
-    );
-    process.exitCode = 1;
-    return;
-  }
-
+  // Pasos 1, 2 y 0: SOLO archivo local + git + operaciones de string, CERO
+  // requests a Supabase. Se corren antes de siquiera revisar si hay
+  // credenciales — si la migración está rota, no hace falta token para
+  // saberlo.
   let migrationSql: string;
   try {
     migrationSql = checkMigrationUnmodified();
+    assertMigrationInvariants(migrationSql);
   } catch (err) {
     console.error((err as Error).message);
     process.exitCode = 1;
     return;
   }
 
-  checkMigrationInvariants(migrationSql);
+  await selfTestFailFast(migrationSql);
+  if (failures > 0) {
+    console.error(`\n=== Resultado final: ${failures} verificación(es) fallida(s) en el auto-test local ===`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!SUPABASE_ACCESS_TOKEN || !SUPABASE_PROJECT_REF) {
+    console.error(
+      "\nBLOQUEADO: faltan SUPABASE_ACCESS_TOKEN y/o SUPABASE_PROJECT_REF.\n" +
+        "Las verificaciones locales (migración sin modificar, invariantes, auto-test\n" +
+        "fail-fast) ya pasaron sin necesitar ninguna credencial. Pero sin esas dos\n" +
+        "variables no se puede comparar la función desplegada ni crear el schema aislado\n" +
+        "para el resto de las pruebas — no se va a usar ninguna alternativa insegura (como\n" +
+        "operar contra las tablas reales). Definilas solo en memoria de tu shell (nunca en\n" +
+        ".env ni en ningún archivo del repo) y volvé a correr `npm run eval:quota`.",
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   try {
     await checkDeployedFunctionMatches(migrationSql);
@@ -625,8 +851,10 @@ async function main() {
 
   await checkPermissions();
 
-  const before = await snapshotRealTables();
-  console.log(`\n(snapshot de las tablas reales ANTES: ${JSON.stringify(before)})`);
+  const before = await snapshotTables("public");
+  console.log(
+    `\n(snapshot ANTES — public.email_user_daily_usage: ${before.email_user_daily_usage.rowCount} filas, digest ${before.email_user_daily_usage.digest}; public.email_global_daily_usage: ${before.email_global_daily_usage.rowCount} filas, digest ${before.email_global_daily_usage.digest})`,
+  );
 
   const schema = generateSchemaName();
   assertValidSchemaName(schema);
@@ -634,6 +862,7 @@ async function main() {
     await createIsolatedSchema(schema);
     console.log(`\nschema aislado creado: ${schema}`);
     await runFunctionalTests(schema);
+    await selfTestDigestComparator(schema);
   } catch (err) {
     fail("error durante las pruebas funcionales en el schema aislado", (err as Error).message);
   } finally {
@@ -644,13 +873,17 @@ async function main() {
   await testCleanupOnForcedFailure();
 
   section("Paso 7: no quedaron schemas de evaluación y las tablas reales no cambiaron");
-  const leftoverRows = await runManagementQuery("select nspname from pg_namespace where nspname like 'quota_eval_%';");
-  if (leftoverRows.length === 0) pass("no queda ningún schema quota_eval_* en pg_namespace");
+  // Patrón EXACTO (con ^ y $) — nunca "like 'quota_eval_%'", que también
+  // matchearía cualquier schema cuyo nombre solo empiece parecido.
+  const leftoverRows = await runManagementQuery("select nspname from pg_namespace where nspname ~ '^quota_eval_[0-9a-f]{16}$';");
+  if (leftoverRows.length === 0) pass("no queda ningún schema que matchee ^quota_eval_[0-9a-f]{16}$ en pg_namespace");
   else fail("quedaron schemas de evaluación sin eliminar", leftoverRows);
 
-  const after = await snapshotRealTables();
-  console.log(`(snapshot de las tablas reales DESPUÉS: ${JSON.stringify(after)})`);
-  if (JSON.stringify(before) === JSON.stringify(after)) pass("las tablas reales de cupo quedaron exactamente iguales");
+  const after = await snapshotTables("public");
+  console.log(
+    `(snapshot DESPUÉS — public.email_user_daily_usage: ${after.email_user_daily_usage.rowCount} filas, digest ${after.email_user_daily_usage.digest}; public.email_global_daily_usage: ${after.email_global_daily_usage.rowCount} filas, digest ${after.email_global_daily_usage.digest})`,
+  );
+  if (snapshotsEqual(before, after)) pass("las tablas reales de cupo quedaron exactamente iguales (mismo conteo y mismo digest)");
   else fail("las tablas reales de cupo cambiaron durante la evaluación", { before, after });
 
   console.log(`\n=== Resultado final: ${failures === 0 ? "TODO OK" : `${failures} verificación(es) fallida(s)`} ===`);
