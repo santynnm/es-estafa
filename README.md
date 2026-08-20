@@ -821,6 +821,103 @@ contra las tablas reales como alternativa.
    representación — así nunca sale de Supabase una fila cruda ni un UUID de usuario: lo
    único que imprime el script es el conteo y el digest (opaco) de cada tabla.
 
+## Avisarle a un familiar (Día 7B)
+
+Interfaz visible del flujo de alertas: después de un análisis con riesgo medio o alto,
+el usuario puede elegir un contacto guardado, confirmar explícitamente, y ver el
+resultado del envío. Con riesgo bajo no se ofrece esta opción en absoluto.
+
+### `X-Check-ID` del lado del cliente
+
+El body de `POST /api/analyze` sigue siendo exactamente `ClassifierResult` (contrato
+compartido, sin cambios) — el `check_id` sigue viajando únicamente en el header
+`X-Check-ID` (`api/analyze.ts`). `analyzeRawText()` (`src/lib/api.ts`) ahora lee ese
+header después de una respuesta exitosa, lo valida como UUID, y devuelve
+`{ result, checkId }` al frontend. Si el header falta o no es un UUID válido, se lanza
+un error controlado en español y **no** se muestra el resultado como disponible para
+alertar — tampoco se reintenta el análisis solo (ya se gastó una llamada real a Gemini).
+
+### Fuente única de contactos
+
+`FamilyContactsProvider` (`src/lib/FamilyContactsProvider.tsx`, expuesto con el hook
+`useFamilyContacts()`) carga `listContacts()` una sola vez y expone `contacts`,
+`loading`, `error`, `addContact`, `removeContact` y `reload` a toda la vista
+autenticada. `FamilyContacts` (gestión) y `FamilyAlert` (selector de alertas) leen y
+escriben sobre esta misma lista — un alta o baja se refleja de inmediato en los dos
+lugares, sin refetch y sin riesgo de desincronización. La sección de gestión expone
+`id="family-contacts"` y un heading enfocable
+(`id="family-contacts-heading"`, `tabIndex={-1}`) para que "Agregar un contacto" en
+`FamilyAlert` pueda desplazarse hasta ahí y mover el foco cuando no hay contactos
+todavía.
+
+### Cliente de `/api/send-alert`
+
+`sendFamilyAlert(checkId, contactId)` (`src/lib/api.ts`) obtiene el access token actual
+con `supabase.auth.getSession()` en cada llamada (nunca cacheado a mano) y manda
+**únicamente** `{ check_id, contact_id }` — nunca destinatario, nombre, `risk_level`,
+señales, explicación, acción recomendada, `raw_text` ni contenido de imagen; todo eso
+lo resuelve el backend con la sesión del usuario, igual que antes. `AlertSendError`
+conserva el mensaje seguro devuelto por el backend, el status HTTP, y — cuando el
+backend lo manda (`429`) — el `Retry-After` ya parseado a segundos, sin usarlo nunca
+para un countdown ni un reintento automático.
+
+### Flujo visible (`FamilyAlert.tsx`)
+
+Se monta junto al veredicto solo cuando existen `result` + `checkId` válidos y
+`risk_level` no es `bajo` (chequeo repetido dentro del propio componente, como defensa
+en profundidad). Estados, en orden:
+
+1. **Cargando contactos**: mensaje de carga, nada es clickeable todavía.
+2. **Error al cargar contactos**: error visible + "Reintentar" (vía `reload()` de la
+   fuente compartida) + "Ir a contactos" — nunca se ofrece enviar con una lista
+   desconocida.
+3. **Sin contactos**: *"Primero agregá al menos un contacto familiar."* + botón
+   *"Agregar un contacto"* que desplaza y enfoca `#family-contacts-heading`. No dispara
+   ninguna request.
+4. **Con contactos**: botón *"Avisarle a un familiar"*. Al abrirlo aparece un `<select>`
+   accesible (nombre + email de cada contacto) **sin preseleccionar a nadie**, sin
+   importar cuántos contactos haya.
+5. **Contacto elegido**: confirmación inline explícita —
+   *"Se enviará una alerta a [nombre] ([email])."* — con **Confirmar envío** y
+   **Cancelar**. Elegir un contacto o cancelar nunca dispara una request; solo
+   **Confirmar envío** llama a `sendFamilyAlert()`.
+6. **Enviando**: controles deshabilitados, *"Enviando alerta..."*. Doble clic real
+   (incluso dos eventos despachados de forma sincrónica en el mismo tick) produce
+   **una sola** request — guard con `useRef` mutado al instante, no solo el `disabled`
+   del siguiente render.
+7. **Éxito**: *"Alerta enviada a [nombre]."* (`role="status"`), el flujo no se vuelve a
+   ofrecer para ese mismo resultado; el veredicto sigue visible, el contacto no se
+   borra, no se vuelve a analizar.
+
+### Cada respuesta HTTP, manejada explícitamente
+
+- **`401`**: mensaje seguro existente (sesión vencida).
+- **`404`**: análisis o contacto no disponible — se muestra el mensaje del backend.
+- **`409` "ya enviado"**: estado informativo (`role="status"`, verde) — *"Ya se había
+  enviado una alerta a este contacto para este análisis."* — no se ofrece reintentar.
+- **`409` "en curso"**: estado informativo (`role="status"`) pidiendo esperar; no
+  reintenta solo.
+- **`422`**: error controlado (no debería ocurrir — riesgo bajo no ofrece el botón).
+- **`429`**: mensaje del backend (`role="alert"`); `Retry-After` queda disponible en
+  `AlertSendError` pero **no** se usa para countdown ni polling ni reintento
+  automático — **Confirmar envío** sigue ahí para un reintento manual más adelante.
+- **`500`/`502`**: error recuperable sin detalles internos (`role="alert"`).
+- **Error de red**: mensaje claro en español.
+- **`200` con body inválido** (sin `{ status: "sent" }`): error controlado — nunca se
+  simula un éxito.
+
+### Ciclo de vida del resultado
+
+`checkId`, la selección de contacto y el estado de la alerta corresponden únicamente al
+análisis visible en pantalla. Se limpian (`clearResult()` en `Analyzer.tsx`) al: iniciar
+un análisis nuevo, editar el texto después de tener un resultado, cambiar entre modo
+texto/imagen, seleccionar/cambiar/quitar una imagen, o si el análisis falla — nunca
+mientras una alerta se está confirmando o enviando. Un `requestIdRef` descarta
+resultados de análisis anteriores que lleguen tarde (si el input cambió o se disparó un
+análisis nuevo mientras el primero seguía en vuelo), para que una respuesta obsoleta no
+pise el estado vigente. Al cerrar sesión, `FamilyContactsProvider` se desmonta junto con
+`Analyzer` y `FamilyContacts` — no queda ningún resto de la sesión anterior.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

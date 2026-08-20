@@ -1,24 +1,17 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { useAuth } from "../lib/useAuth";
-import {
-  listContacts,
-  addContact,
-  deleteContact,
-  ContactsError,
-  MAX_NOMBRE_LENGTH,
-  MAX_EMAIL_LENGTH,
-  type FamilyContact,
-} from "../lib/contacts";
+import { useState, type FormEvent } from "react";
+import { useFamilyContacts } from "../lib/useFamilyContacts";
+import { ContactsError, MAX_NOMBRE_LENGTH, MAX_EMAIL_LENGTH } from "../lib/contacts";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Gestión de contactos familiares. Desde el Día 7B lee y escribe sobre la
+// misma lista compartida que usa FamilyAlert (FamilyContactsProvider) — un
+// alta o baja acá se refleja de inmediato en el selector de alertas, sin
+// refetch. La sección expone un id/heading enfocable (#family-contacts,
+// #family-contacts-heading) para que "Agregar un contacto" en FamilyAlert
+// pueda desplazarse y mover el foco acá cuando no hay contactos todavía.
 export function FamilyContacts() {
-  const { session } = useAuth();
-  const userId = session?.user.id ?? "";
-
-  const [contacts, setContacts] = useState<FamilyContact[] | null>(null);
-  const [listLoading, setListLoading] = useState(true);
-  const [listError, setListError] = useState<string | null>(null);
+  const { contacts, loading: listLoading, error: listError, addContact, removeContact } = useFamilyContacts();
 
   const [nombre, setNombre] = useState("");
   const [email, setEmail] = useState("");
@@ -28,27 +21,6 @@ export function FamilyContacts() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setListLoading(true);
-    setListError(null);
-    listContacts()
-      .then((data) => {
-        if (!cancelled) setContacts(data);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setListError(err instanceof ContactsError ? err.message : "No se pudieron cargar los contactos.");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setListLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   async function handleAdd(e: FormEvent) {
     e.preventDefault();
@@ -81,8 +53,7 @@ export function FamilyContacts() {
     setAddLoading(true);
     setAddError(null);
     try {
-      const created = await addContact(userId, trimmedNombre, trimmedEmail);
-      setContacts((prev) => [...(prev ?? []), created]);
+      await addContact(trimmedNombre, trimmedEmail);
       setNombre("");
       setEmail("");
     } catch (err) {
@@ -97,8 +68,7 @@ export function FamilyContacts() {
     setDeletingId(id);
     setDeleteError(null);
     try {
-      await deleteContact(id);
-      setContacts((prev) => (prev ?? []).filter((c) => c.id !== id));
+      await removeContact(id);
       setConfirmDeleteId(null);
     } catch (err) {
       setDeleteError(err instanceof ContactsError ? err.message : "No se pudo eliminar el contacto.");
@@ -108,11 +78,13 @@ export function FamilyContacts() {
   }
 
   return (
-    <section className="mx-auto max-w-2xl px-4 pb-8 sm:px-6">
-      <h2 className="text-2xl font-bold">Contactos familiares</h2>
+    <section id="family-contacts" className="mx-auto max-w-2xl px-4 pb-8 sm:px-6">
+      <h2 id="family-contacts-heading" tabIndex={-1} className="text-2xl font-bold focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400 rounded">
+        Contactos familiares
+      </h2>
       <p className="mt-1 text-base text-gray-600 dark:text-gray-400">
-        Guardá el email de alguien de confianza. Más adelante vas a poder avisarle si un análisis da riesgo
-        medio o alto.
+        Guardá el email de alguien de confianza para poder avisarle si un análisis da riesgo medio o
+        alto.
       </p>
 
       {listLoading && (

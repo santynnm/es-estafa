@@ -1,5 +1,6 @@
 import { useAuth } from "./lib/useAuth";
 import { supabase } from "./lib/supabaseClient";
+import { FamilyContactsProvider } from "./lib/FamilyContactsProvider";
 import { AuthScreen } from "./components/AuthScreen";
 import { Analyzer } from "./components/Analyzer";
 import { FamilyContacts } from "./components/FamilyContacts";
@@ -17,10 +18,11 @@ function LoadingScreen() {
 function AccountBar({ email }: { email: string }) {
   async function handleSignOut() {
     await supabase.auth.signOut();
-    // Analyzer y FamilyContacts se desmontan al perder la sesión (App deja
-    // de renderizarlos), así que todo su estado (texto, imagen, resultado,
-    // error, lista de contactos) se descarta con ellos — no queda nada de
-    // la sesión anterior visible al volver a ingresar.
+    // Analyzer, FamilyContacts y FamilyContactsProvider se desmontan al
+    // perder la sesión (App deja de renderizarlos), así que todo su estado
+    // (texto, imagen, resultado, check_id, estado de alerta, lista de
+    // contactos) se descarta con ellos — no queda nada de la sesión
+    // anterior visible al volver a ingresar.
   }
 
   return (
@@ -51,8 +53,10 @@ function App() {
   return (
     <div className="min-h-svh bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
       <AccountBar email={session.user.email ?? ""} />
-      <Analyzer />
-      <FamilyContacts />
+      <FamilyContactsProvider>
+        <Analyzer />
+        <FamilyContacts />
+      </FamilyContactsProvider>
     </div>
   );
 }

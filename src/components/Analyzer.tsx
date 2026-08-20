@@ -4,16 +4,18 @@ import { analyzeRawText, extractTextFromImage, AnalyzeError, type ImageMimeType 
 import { fileToBase64, FileReadError } from "../lib/imageFile";
 import { ResultCard } from "./ResultCard";
 import { ImageUpload } from "./ImageUpload";
+import { FamilyAlert } from "./FamilyAlert";
 
 const MAX_LENGTH = 6000;
 
 type Mode = "text" | "image";
 type Stage = "idle" | "reading" | "analyzing";
 
-// Analizador de texto/imagen tal como quedó al final del Día 3-4B (incluida
-// la corrección que limpia resultado/error al quitar o reemplazar una
-// captura). Extraído de App.tsx en el Día 5-6A para vivir detrás del gate de
-// autenticación, sin cambios de comportamiento.
+// Analizador de texto/imagen. Desde el Día 7B guarda también el check_id que
+// devuelve /api/analyze (header X-Check-ID, ver src/lib/api.ts) junto con el
+// resultado, para poder ofrecer "Avisarle a un familiar" (FamilyAlert) sin
+// que el backend tenga que confiar en nada que mande el cliente aparte de
+// esos dos ids ya persistidos.
 export function Analyzer() {
   const [mode, setMode] = useState<Mode>("text");
   const [text, setText] = useState("");
@@ -22,6 +24,7 @@ export function Analyzer() {
   const [stage, setStage] = useState<Stage>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ClassifierResult | null>(null);
+  const [checkId, setCheckId] = useState<string | null>(null);
 
   // Guard síncrono contra doble clic/envío duplicado: `stage` es estado de
   // React (actualización asíncrona/batcheada), así que dos clicks casi
@@ -29,17 +32,45 @@ export function Analyzer() {
   // se muta al instante, sin esperar el ciclo de render.
   const submittingRef = useRef(false);
 
+  // Sube en cada análisis iniciado; una respuesta que llega tarde (de un
+  // análisis anterior, si el input cambió o se disparó uno nuevo mientras la
+  // primera request seguía en vuelo) se descarta comparando contra el valor
+  // vigente al momento de aplicar el resultado, en vez de pisar el estado
+  // actual con datos obsoletos.
+  const requestIdRef = useRef(0);
+
   const trimmedText = text.trim();
   const canSubmit =
     stage === "idle" &&
     (mode === "text" ? trimmedText.length > 0 : imageFile !== null && !imageValidationError);
 
+  // Limpia resultado, check_id y (al desmontar FamilyAlert) cualquier estado
+  // de alerta en curso — se llama cada vez que el análisis vigente deja de
+  // corresponder al que se ve en pantalla: cambio de modo, edición del
+  // texto tras un resultado, selección/cambio/remoción de imagen, o el
+  // arranque de un análisis nuevo. Nunca se llama mientras una alerta se
+  // está confirmando o enviando (eso vive en FamilyAlert, que se desmonta
+  // junto con este estado, pero solo como consecuencia de que el usuario ya
+  // decidió cambiar de análisis, no de manera espontánea).
+  function clearResult() {
+    setResult(null);
+    setCheckId(null);
+  }
+
   function handleModeChange(nextMode: Mode) {
     if (nextMode === mode) return;
     setMode(nextMode);
     setError(null);
-    setResult(null);
+    clearResult();
     setImageValidationError(null);
+  }
+
+  function handleTextChange(value: string) {
+    setText(value);
+    if (result) {
+      clearResult();
+      setError(null);
+    }
   }
 
   // Centraliza el cambio de archivo (selección, cambio o "Quitar" -> null):
@@ -49,7 +80,7 @@ export function Analyzer() {
   // administra ImageUpload para el archivo nuevo.
   function handleImageFileChange(file: File | null) {
     setImageFile(file);
-    setResult(null);
+    clearResult();
     setError(null);
   }
 
@@ -57,20 +88,28 @@ export function Analyzer() {
     e.preventDefault();
     if (submittingRef.current) return;
 
+    const requestId = ++requestIdRef.current;
+    const isStale = () => requestIdRef.current !== requestId;
+
     if (mode === "text") {
       if (!trimmedText) return;
       submittingRef.current = true;
       setError(null);
-      setResult(null);
+      clearResult();
       setStage("analyzing");
       try {
-        const classification = await analyzeRawText(trimmedText, "text");
-        setResult(classification);
+        const outcome = await analyzeRawText(trimmedText, "text");
+        if (!isStale()) {
+          setResult(outcome.result);
+          setCheckId(outcome.checkId);
+        }
       } catch (err) {
-        setError(err instanceof AnalyzeError ? err.message : "Ocurrió un error inesperado. Probá de nuevo.");
+        if (!isStale()) {
+          setError(err instanceof AnalyzeError ? err.message : "Ocurrió un error inesperado. Probá de nuevo.");
+        }
       } finally {
         submittingRef.current = false;
-        setStage("idle");
+        if (!isStale()) setStage("idle");
       }
       return;
     }
@@ -78,23 +117,29 @@ export function Analyzer() {
     if (!imageFile || imageValidationError) return;
     submittingRef.current = true;
     setError(null);
-    setResult(null);
+    clearResult();
     setStage("reading");
     try {
       const base64 = await fileToBase64(imageFile);
       const rawText = await extractTextFromImage(base64, imageFile.type as ImageMimeType);
+      if (isStale()) return;
       setStage("analyzing");
-      const classification = await analyzeRawText(rawText, "image_ocr");
-      setResult(classification);
+      const outcome = await analyzeRawText(rawText, "image_ocr");
+      if (!isStale()) {
+        setResult(outcome.result);
+        setCheckId(outcome.checkId);
+      }
     } catch (err) {
-      setError(
-        err instanceof AnalyzeError || err instanceof FileReadError
-          ? err.message
-          : "Ocurrió un error inesperado. Probá de nuevo.",
-      );
+      if (!isStale()) {
+        setError(
+          err instanceof AnalyzeError || err instanceof FileReadError
+            ? err.message
+            : "Ocurrió un error inesperado. Probá de nuevo.",
+        );
+      }
     } finally {
       submittingRef.current = false;
-      setStage("idle");
+      if (!isStale()) setStage("idle");
     }
   }
 
@@ -160,7 +205,7 @@ export function Analyzer() {
             <textarea
               id="raw_text"
               value={text}
-              onChange={(e) => setText(e.target.value)}
+              onChange={(e) => handleTextChange(e.target.value)}
               maxLength={MAX_LENGTH}
               rows={8}
               placeholder='Ej: "Su tarjeta fue bloqueada. Ingrese ahora a este enlace y confirme su clave para reactivarla."'
@@ -204,7 +249,12 @@ export function Analyzer() {
         </div>
       )}
 
-      {result && <ResultCard result={result} />}
+      {result && (
+        <>
+          <ResultCard result={result} />
+          {checkId && result.risk_level !== "bajo" && <FamilyAlert checkId={checkId} riskLevel={result.risk_level} />}
+        </>
+      )}
 
       <footer className="mt-10 border-t border-gray-200 pt-6 text-sm text-gray-500 dark:border-gray-800 dark:text-gray-400">
         Esta herramienta orienta, pero no garantiza un resultado con certeza absoluta. Ante la duda,
