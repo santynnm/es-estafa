@@ -881,13 +881,17 @@ en profundidad). Estados, en orden:
    *"Se enviará una alerta a [nombre] ([email])."* — con **Confirmar envío** y
    **Cancelar**. Elegir un contacto o cancelar nunca dispara una request; solo
    **Confirmar envío** llama a `sendFamilyAlert()`.
-6. **Enviando**: controles deshabilitados, *"Enviando alerta..."*. Doble clic real
-   (incluso dos eventos despachados de forma sincrónica en el mismo tick) produce
-   **una sola** request — guard con `useRef` mutado al instante, no solo el `disabled`
-   del siguiente render.
+6. **Enviando**: controles del propio `FamilyAlert` deshabilitados, *"Enviando
+   alerta..."*. Doble clic real (incluso dos eventos despachados de forma sincrónica en
+   el mismo tick) produce **una sola** request — guard con `useRef` mutado al instante,
+   no solo el `disabled` del siguiente render. Desde la corrección 7B.1, este mismo
+   instante también bloquea el resto de la app — ver "Bloqueo coordinado durante un
+   envío de alerta" más abajo.
 7. **Éxito**: *"Alerta enviada a [nombre]."* (`role="status"`), el flujo no se vuelve a
    ofrecer para ese mismo resultado; el veredicto sigue visible, el contacto no se
-   borra, no se vuelve a analizar.
+   borra, no se vuelve a analizar. El nombre viene de una copia capturada al confirmar
+   el envío (`{ kind: "sent", contactName }`), no de un lookup en vivo contra la lista
+   de contactos — ver "Estado de éxito independiente de la lista mutable" (7B.1).
 
 ### Cada respuesta HTTP, manejada explícitamente
 
@@ -909,14 +913,89 @@ en profundidad). Estados, en orden:
 ### Ciclo de vida del resultado
 
 `checkId`, la selección de contacto y el estado de la alerta corresponden únicamente al
-análisis visible en pantalla. Se limpian (`clearResult()` en `Analyzer.tsx`) al: iniciar
-un análisis nuevo, editar el texto después de tener un resultado, cambiar entre modo
-texto/imagen, seleccionar/cambiar/quitar una imagen, o si el análisis falla — nunca
-mientras una alerta se está confirmando o enviando. Un `requestIdRef` descarta
-resultados de análisis anteriores que lleguen tarde (si el input cambió o se disparó un
-análisis nuevo mientras el primero seguía en vuelo), para que una respuesta obsoleta no
-pise el estado vigente. Al cerrar sesión, `FamilyContactsProvider` se desmonta junto con
-`Analyzer` y `FamilyContacts` — no queda ningún resto de la sesión anterior.
+análisis visible en pantalla — ver la corrección 7B.1 (`Analyzer.tsx`) para el mecanismo
+exacto que lo garantiza incluso ante requests concurrentes.
+
+### Invalidación generacional y aborto real (corrección 7B.1)
+
+Antes de 7B.1, un `requestIdRef` simple descartaba respuestas obsoletas por número de
+generación, pero **no cancelaba el `fetch` en curso** — la request vieja seguía viva de
+fondo, gastando cuota real de Gemini/Brevo sin necesidad, y su `finally` podía competir
+con el de una request más nueva. 7B.1 corrige ambas cosas:
+
+- **`generationRef`** (contador monotónico) identifica "el análisis vigente". Cada
+  invalidación lo incrementa de inmediato — nunca se posterga.
+- **`activeRequestRef`** guarda `{ id, controller }` de la request en vuelo (si hay una):
+  un `AbortController` real, cuyo `signal` se propaga a los `fetch` de `/api/analyze` y
+  `/api/extract-image` (`src/lib/api.ts`, parámetro `signal` opcional en
+  `analyzeRawText()`/`extractTextFromImage()` — no cambia el contrato HTTP ni el body).
+- **`invalidateActiveRequest()`** es la única operación de invalidación: incrementa
+  `generationRef`, llama a `controller.abort()` si hay algo en vuelo, limpia
+  `activeRequestRef`, libera `submittingRef` de forma segura, devuelve `stage` a
+  `"idle"`, y limpia `result`/`checkId`/`error`. La usan los cinco disparadores de la
+  sección A: editar el texto, cambiar de modo, cambiar/quitar una imagen, iniciar un
+  análisis nuevo, y el cleanup del `useEffect` de desmontaje (que además dispara al
+  cerrar sesión, ya que eso desmonta `Analyzer`) — este último NUNCA llama a `setState`,
+  solo aborta, para no generar el warning de React por actualizar un componente ya
+  desmontado.
+- **Ni el contador solo, ni el abort solo, alcanzan**: un abort real corta el `fetch` de
+  verdad (ahorra cuota), pero una promesa ya resuelta (o, en los tests, un mock que
+  ignora el signal) puede seguir llegando a su `then`/`catch`/`finally` de todas formas
+  — por eso cada callback asíncrono compara su propio `requestId` contra
+  `generationRef.current` (`isActive()`) **antes** de tocar cualquier estado, incluso
+  después de un `await` a `fileToBase64()` (no abortable, por ser lectura local) antes
+  de gastar una llamada real de OCR.
+- **Ownership del `finally`**: solo la request que sigue siendo la vigente
+  (`isActive()` verdadero en ese momento) puede liberar `submittingRef`, volver a
+  `"idle"` y limpiar `activeRequestRef`. La request vieja, aunque su `finally` se ejecute
+  más tarde (por ejemplo, porque su mock tardó más que el de la request nueva), no toca
+  nada — así una carrera real A→invalidar→B nunca deja que el `finally` tardío de A
+  pise el estado de B, ni libere un guard que ya le pertenece a B.
+- Un abort deliberado nunca se muestra como error: `postJsonRaw()` relanza
+  `DOMException("AbortError")` tal cual (sin envolverlo en `AnalyzeError`), y el
+  `catch` de `handleSubmit` no setea ningún error cuando `isAbort` es verdadero.
+
+### Bloqueo coordinado durante un envío de alerta (corrección 7B.1)
+
+Mientras `FamilyAlert` tiene una request real de envío en vuelo, un booleano
+`alertSending` (contexto en `src/lib/alertSendingContextDef.ts`, `useAlertSending()`,
+provisto en `App.tsx` — ancestro común de `Analyzer`, `FamilyContacts` y el botón de
+logout) queda en `true` desde justo antes de llamar a `sendFamilyAlert()` hasta su
+`finally` (éxito o error). Mientras es `true`:
+
+- `Analyzer`: textarea, botones de modo, `ImageUpload` y "Analizar" quedan
+  deshabilitados, y además cada handler (`handleTextChange`, `handleModeChange`,
+  `handleImageFileChange`, `handleSubmit`) empieza con `if (alertSending) return;` — no
+  alcanza con el atributo `disabled` del DOM, porque un evento sintético despachado
+  directamente (`element.dispatchEvent(...)`, sin pasar por un click real) puede llegar
+  a saltarse el chequeo de accionabilidad de algunos frameworks de test; el guard vive
+  en el handler mismo.
+- `FamilyContacts`: alta y baja de contactos deshabilitadas de la misma forma
+  (`handleAdd`/`handleDelete` con el mismo guard temprano).
+- `AccountBar` (`App.tsx`): "Cerrar sesión" deshabilitado, con el mismo guard en
+  `handleSignOut`.
+- `FamilyAlert` sigue deshabilitando su propio selector/confirmación/cancelación, como
+  ya hacía.
+
+El bloqueo dura exactamente la request: antes de confirmar, el usuario puede cancelar o
+cambiar de análisis libremente; apenas se resuelve (éxito o error), `alertSending` vuelve
+a `false` y todo se rehabilita — nunca queda la app bloqueada de forma permanente ante un
+fallo. No se intenta impedir cerrar la pestaña o perder la conexión — solo se coordinan
+las acciones controladas por la UI. Verificado con eventos sintéticos despachados
+directamente sobre el DOM (`dispatchEvent` en el textarea y en "Cerrar sesión") mientras
+`alertSending` es `true`: ninguno de los dos tuvo efecto.
+
+### Estado de éxito independiente de la lista mutable (corrección 7B.1)
+
+El nombre del contacto se captura como un valor plano (`contactNameToSend`) **antes** de
+llamar a `sendFamilyAlert()`, y ese valor —no un lookup en vivo contra `contacts`— es el
+que queda guardado en el outcome exitoso (`{ kind: "sent", contactName }`). Antes de esta
+corrección, el mensaje de éxito buscaba el contacto por id en la lista compartida en el
+momento de renderizar, así que si esa lista cambiaba después (el mismo contacto
+eliminado, por ejemplo, o la lista recargándose), el mensaje podía mostrar el nombre de
+otro contacto o, peor, mostrar el texto de "ya se había enviado" en vez del éxito real.
+Verificado: tras un envío exitoso, eliminar ese mismo contacto desde `FamilyContacts` no
+cambia ni borra el mensaje "Alerta enviada a [nombre]." ya mostrado.
 
 ## Límite del tier gratuito de Gemini (429)
 

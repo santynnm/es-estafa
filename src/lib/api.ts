@@ -44,7 +44,14 @@ function extractErrorMessage(data: unknown): string {
 // getSession() en cada llamada, nunca cacheado a mano) y devuelve tanto el
 // body parseado como el Response crudo, para que cada caller pueda leer
 // headers propios (X-Check-ID, Retry-After) sin duplicar el fetch.
-async function postJsonRaw(url: string, payload: unknown): Promise<{ data: unknown; response: Response }> {
+//
+// Acepta un AbortSignal opcional (corrección 7B.1): Analyzer lo usa para
+// cortar de verdad un análisis/OCR en curso cuando el usuario invalida esa
+// request (edita el input, cambia de modo/imagen, dispara un análisis
+// nuevo). Un abort deliberado se relanza tal cual (DOMException
+// "AbortError"), sin envolverlo en AnalyzeError — así el caller puede
+// distinguirlo de un error de red real y no mostrar ningún mensaje.
+async function postJsonRaw(url: string, payload: unknown, signal?: AbortSignal): Promise<{ data: unknown; response: Response }> {
   const { data: sessionData } = await supabase.auth.getSession();
   const accessToken = sessionData.session?.access_token;
   if (!accessToken) {
@@ -60,8 +67,10 @@ async function postJsonRaw(url: string, payload: unknown): Promise<{ data: unkno
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify(payload),
+      signal,
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") throw err;
     throw new AnalyzeError("No pudimos conectar con el servidor. Revisá tu conexión e intentá de nuevo.");
   }
 
@@ -75,8 +84,8 @@ async function postJsonRaw(url: string, payload: unknown): Promise<{ data: unkno
   return { data, response };
 }
 
-async function postJson<TResponse>(url: string, payload: unknown): Promise<TResponse> {
-  const { data, response } = await postJsonRaw(url, payload);
+async function postJson<TResponse>(url: string, payload: unknown, signal?: AbortSignal): Promise<TResponse> {
+  const { data, response } = await postJsonRaw(url, payload, signal);
   if (!response.ok) {
     throw new AnalyzeError(extractErrorMessage(data));
   }
@@ -90,9 +99,16 @@ async function postJson<TResponse>(url: string, payload: unknown): Promise<TResp
 // disponible para alertar: se lanza un error controlado y no se reintenta
 // el análisis solo — ya se gastó la llamada real a Gemini, reintentar
 // automáticamente la duplicaría sin necesidad.
-export async function analyzeRawText(rawText: string, sourceType: FrontendSourceType): Promise<AnalyzeOutcome> {
+//
+// El signal opcional no cambia el contrato HTTP ni el body enviado — solo
+// permite abortar la request desde el caller (ver Analyzer.tsx).
+export async function analyzeRawText(
+  rawText: string,
+  sourceType: FrontendSourceType,
+  signal?: AbortSignal,
+): Promise<AnalyzeOutcome> {
   const payload: ClassifierRequest = { raw_text: rawText, source_type: sourceType };
-  const { data, response } = await postJsonRaw("/api/analyze", payload);
+  const { data, response } = await postJsonRaw("/api/analyze", payload, signal);
 
   if (!response.ok) {
     throw new AnalyzeError(extractErrorMessage(data));
@@ -110,9 +126,9 @@ export async function analyzeRawText(rawText: string, sourceType: FrontendSource
 
 // Extrae el texto visible de una captura de pantalla. No clasifica riesgo —
 // el resultado se pasa después a analyzeRawText con source_type: "image_ocr".
-export async function extractTextFromImage(imageBase64: string, mimeType: ImageMimeType): Promise<string> {
+export async function extractTextFromImage(imageBase64: string, mimeType: ImageMimeType, signal?: AbortSignal): Promise<string> {
   const payload: ExtractImageRequest = { image_base64: imageBase64, mime_type: mimeType };
-  const { raw_text } = await postJson<ExtractImageResponse>("/api/extract-image", payload);
+  const { raw_text } = await postJson<ExtractImageResponse>("/api/extract-image", payload, signal);
   return raw_text;
 }
 

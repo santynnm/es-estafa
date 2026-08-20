@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import type { RiskLevel } from "../../shared/classifierContract";
 import { sendFamilyAlert, AlertSendError } from "../lib/api";
 import { useFamilyContacts } from "../lib/useFamilyContacts";
+import { useAlertSending } from "../lib/useAlertSending";
 
 type SendOutcome =
-  | { kind: "sent" }
+  | { kind: "sent"; contactName: string }
   | { kind: "already_sent" }
   | { kind: "in_progress" }
   | { kind: "error"; message: string };
@@ -25,15 +26,19 @@ function focusFamilyContacts() {
 // Nunca manda al backend nada más que check_id + contact_id (sendFamilyAlert,
 // src/lib/api.ts) — el resto (destinatario, señales, explicación, etc.) lo
 // resuelve /api/send-alert del lado del servidor.
+//
+// Corrección 7B.1: usa el booleano compartido `alertSending` (en vez de un
+// estado "sending" propio) para que Analyzer, FamilyContacts y el logout
+// puedan coordinarse mientras un envío real está en vuelo.
 export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel: RiskLevel }) {
   const { contacts, loading, error: contactsError, reload } = useFamilyContacts();
+  const { alertSending, setAlertSending } = useAlertSending();
 
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
   const [outcome, setOutcome] = useState<SendOutcome | null>(null);
 
-  // Guard síncrono contra doble clic: `sending` es estado de React (no
+  // Guard síncrono contra doble clic: `alertSending` es estado de React (no
   // aplica al instante), así que dos clicks casi simultáneos podrían leer
   // "false" los dos antes del primer re-render.
   const sendingRef = useRef(false);
@@ -42,7 +47,9 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
 
   // Si el contacto seleccionado se elimina desde FamilyContacts (misma
   // fuente compartida), la selección y cualquier confirmación pendiente se
-  // limpian solas.
+  // limpian solas. No puede pasar mientras alertSending es true (la baja de
+  // contactos está bloqueada en ese momento), pero queda igual como
+  // salvaguarda genérica.
   useEffect(() => {
     if (selectedContactId && contacts && !contacts.some((c) => c.id === selectedContactId)) {
       setSelectedContactId(null);
@@ -52,24 +59,34 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
   if (riskLevel === "bajo") return null;
 
   function openSelector() {
+    if (alertSending) return;
     setSelectorOpen(true);
     setSelectedContactId(null);
     setOutcome(null);
   }
 
   function cancel() {
+    if (alertSending) return;
     setSelectorOpen(false);
     setSelectedContactId(null);
   }
 
   async function confirmSend() {
     if (sendingRef.current || !selectedContact) return;
+    // Captura nombre/id ANTES de que arranque el envío: el mensaje de éxito
+    // no puede depender de que `contacts` siga teniendo esta fila más
+    // adelante (aunque, con alertSending en true, la baja de contactos ya
+    // está bloqueada — esto es además una garantía por diseño, no solo
+    // consecuencia de ese bloqueo).
+    const contactIdToSend = selectedContact.id;
+    const contactNameToSend = selectedContact.nombre;
+
     sendingRef.current = true;
-    setSending(true);
+    setAlertSending(true);
     setOutcome(null);
     try {
-      await sendFamilyAlert(checkId, selectedContact.id);
-      setOutcome({ kind: "sent" });
+      await sendFamilyAlert(checkId, contactIdToSend);
+      setOutcome({ kind: "sent", contactName: contactNameToSend });
     } catch (err) {
       if (err instanceof AlertSendError) {
         if (err.status === 409 && /ya se envió/i.test(err.message)) {
@@ -84,12 +101,15 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
       }
     } finally {
       sendingRef.current = false;
-      setSending(false);
+      setAlertSending(false);
     }
   }
 
   // Ya se confirmó un envío exitoso (o ya estaba enviado de antes): no se
-  // vuelve a ofrecer el flujo para este mismo resultado.
+  // vuelve a ofrecer el flujo para este mismo resultado. El nombre viene del
+  // outcome capturado al confirmar, nunca de un lookup en vivo sobre
+  // `contacts` — así un cambio posterior en la lista (en otra pestaña, por
+  // ejemplo) no puede alterar retroactivamente este mensaje.
   if (outcome?.kind === "sent" || outcome?.kind === "already_sent") {
     return (
       <div
@@ -97,8 +117,8 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         aria-live="polite"
         className="mt-4 rounded-xl border-2 border-green-300 bg-green-50 p-4 text-base text-green-900 dark:border-green-700 dark:bg-green-950 dark:text-green-100"
       >
-        {outcome.kind === "sent" && selectedContact
-          ? `Alerta enviada a ${selectedContact.nombre}.`
+        {outcome.kind === "sent"
+          ? `Alerta enviada a ${outcome.contactName}.`
           : "Ya se había enviado una alerta a este contacto para este análisis."}
       </div>
     );
@@ -162,7 +182,8 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         <button
           type="button"
           onClick={openSelector}
-          className="w-full rounded-xl border-2 border-purple-600 bg-white px-6 py-4 text-lg font-bold text-purple-700 shadow-sm transition hover:bg-purple-50 dark:bg-gray-900 dark:text-purple-300 dark:hover:bg-gray-800"
+          disabled={alertSending}
+          className="w-full rounded-xl border-2 border-purple-600 bg-white px-6 py-4 text-lg font-bold text-purple-700 shadow-sm transition hover:bg-purple-50 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-gray-900 dark:text-purple-300 dark:hover:bg-gray-800"
         >
           Avisarle a un familiar
         </button>
@@ -178,9 +199,9 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
       <select
         id="family-alert-contact"
         value={selectedContactId ?? ""}
-        disabled={sending}
+        disabled={alertSending}
         onChange={(e) => setSelectedContactId(e.target.value || null)}
-        className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-3 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
+        className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-3 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
       >
         <option value="" disabled>
           Seleccioná un contacto...
@@ -216,22 +237,22 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
             <button
               type="button"
               onClick={confirmSend}
-              disabled={sending}
+              disabled={alertSending}
               className="rounded-xl bg-purple-600 px-5 py-3 text-base font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
             >
-              {sending ? "Enviando alerta..." : "Confirmar envío"}
+              {alertSending ? "Enviando alerta..." : "Confirmar envío"}
             </button>
             <button
               type="button"
               onClick={cancel}
-              disabled={sending}
-              className="rounded-xl border border-gray-300 px-5 py-3 text-base font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+              disabled={alertSending}
+              className="rounded-xl border border-gray-300 px-5 py-3 text-base font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
             >
               Cancelar
             </button>
           </div>
 
-          {sending && (
+          {alertSending && (
             <p role="status" aria-live="polite" className="sr-only">
               Enviando alerta...
             </p>

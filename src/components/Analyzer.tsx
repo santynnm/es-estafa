@@ -1,7 +1,8 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { ClassifierResult } from "../../shared/classifierContract";
 import { analyzeRawText, extractTextFromImage, AnalyzeError, type ImageMimeType } from "../lib/api";
 import { fileToBase64, FileReadError } from "../lib/imageFile";
+import { useAlertSending } from "../lib/useAlertSending";
 import { ResultCard } from "./ResultCard";
 import { ImageUpload } from "./ImageUpload";
 import { FamilyAlert } from "./FamilyAlert";
@@ -11,12 +12,22 @@ const MAX_LENGTH = 6000;
 type Mode = "text" | "image";
 type Stage = "idle" | "reading" | "analyzing";
 
+interface ActiveRequest {
+  id: number;
+  controller: AbortController;
+}
+
 // Analizador de texto/imagen. Desde el Día 7B guarda también el check_id que
 // devuelve /api/analyze (header X-Check-ID, ver src/lib/api.ts) junto con el
 // resultado, para poder ofrecer "Avisarle a un familiar" (FamilyAlert) sin
 // que el backend tenga que confiar en nada que mande el cliente aparte de
 // esos dos ids ya persistidos.
+//
+// Corrección 7B.1: ciclo de vida seguro de requests concurrentes — ver
+// invalidateActiveRequest() y el comentario sobre generationRef más abajo.
 export function Analyzer() {
+  const { alertSending } = useAlertSending();
+
   const [mode, setMode] = useState<Mode>("text");
   const [text, setText] = useState("");
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -32,45 +43,73 @@ export function Analyzer() {
   // se muta al instante, sin esperar el ciclo de render.
   const submittingRef = useRef(false);
 
-  // Sube en cada análisis iniciado; una respuesta que llega tarde (de un
-  // análisis anterior, si el input cambió o se disparó uno nuevo mientras la
-  // primera request seguía en vuelo) se descarta comparando contra el valor
-  // vigente al momento de aplicar el resultado, en vez de pisar el estado
-  // actual con datos obsoletos.
-  const requestIdRef = useRef(0);
+  // generationRef: contador monotónico que identifica "el análisis vigente".
+  // Cada invalidación (edición de input, cambio de modo/imagen, análisis
+  // nuevo, desmontaje) lo incrementa de inmediato. activeRequestRef guarda
+  // el AbortController de la request en vuelo (si hay una) junto con el id
+  // de generación que tenía cuando arrancó. Ninguno de los dos alcanza por
+  // sí solo: el AbortController corta el fetch de verdad, pero una promesa
+  // ya resuelta (o un mock de test que ignora el signal) puede seguir
+  // llegando al then/catch/finally igual — por eso cada callback async
+  // compara su propio requestId contra generationRef.current (isActive())
+  // antes de tocar cualquier estado. Y el contador solo sin abortar
+  // dejaría el fetch real corriendo de fondo sin necesidad.
+  const generationRef = useRef(0);
+  const activeRequestRef = useRef<ActiveRequest | null>(null);
 
   const trimmedText = text.trim();
   const canSubmit =
     stage === "idle" &&
+    !alertSending &&
     (mode === "text" ? trimmedText.length > 0 : imageFile !== null && !imageValidationError);
 
-  // Limpia resultado, check_id y (al desmontar FamilyAlert) cualquier estado
-  // de alerta en curso — se llama cada vez que el análisis vigente deja de
-  // corresponder al que se ve en pantalla: cambio de modo, edición del
-  // texto tras un resultado, selección/cambio/remoción de imagen, o el
-  // arranque de un análisis nuevo. Nunca se llama mientras una alerta se
-  // está confirmando o enviando (eso vive en FamilyAlert, que se desmonta
-  // junto con este estado, pero solo como consecuencia de que el usuario ya
-  // decidió cambiar de análisis, no de manera espontánea).
-  function clearResult() {
+  // Única operación de invalidación: cancela lo que esté en vuelo (si hay
+  // algo) y deja el analizador en un estado limpio, listo para un análisis
+  // nuevo sin esperar la respuesta vieja. Se usa para los cinco disparadores
+  // de la sección A (editar texto, cambiar modo, cambiar/quitar imagen,
+  // iniciar un análisis nuevo, desmontar/cerrar sesión) — nunca se duplica
+  // esta lógica en otro lado.
+  function invalidateActiveRequest() {
+    generationRef.current += 1;
+    const current = activeRequestRef.current;
+    activeRequestRef.current = null;
+    current?.controller.abort();
+    submittingRef.current = false;
+    setStage("idle");
     setResult(null);
     setCheckId(null);
+    setError(null);
   }
 
+  // Al desmontar (incluye cierre de sesión, que desmonta Analyzer desde
+  // App): aborta lo que esté en vuelo pero NUNCA llama a setState — el
+  // componente ya se está yendo, y tocar estado acá dispararía el warning
+  // de React por actualizar un componente desmontado.
+  useEffect(() => {
+    return () => {
+      generationRef.current += 1;
+      activeRequestRef.current?.controller.abort();
+      activeRequestRef.current = null;
+    };
+  }, []);
+
   function handleModeChange(nextMode: Mode) {
+    if (alertSending) return;
     if (nextMode === mode) return;
     setMode(nextMode);
-    setError(null);
-    clearResult();
+    invalidateActiveRequest();
     setImageValidationError(null);
   }
 
   function handleTextChange(value: string) {
+    if (alertSending) return;
     setText(value);
-    if (result) {
-      clearResult();
-      setError(null);
-    }
+    // Siempre invalida (no solo cuando ya hay result): también limpia un
+    // error de un intento anterior que quedó colgado sin resultado, y
+    // corta cualquier análisis en vuelo — es barato llamarla de más,
+    // React no re-renderiza por setear un estado al mismo valor que ya
+    // tenía.
+    invalidateActiveRequest();
   }
 
   // Centraliza el cambio de archivo (selección, cambio o "Quitar" -> null):
@@ -79,58 +118,54 @@ export function Analyzer() {
   // seleccionado. `imageValidationError` se mantiene aparte porque lo
   // administra ImageUpload para el archivo nuevo.
   function handleImageFileChange(file: File | null) {
+    if (alertSending) return;
     setImageFile(file);
-    clearResult();
-    setError(null);
+    invalidateActiveRequest();
   }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    if (alertSending) return;
     if (submittingRef.current) return;
 
-    const requestId = ++requestIdRef.current;
-    const isStale = () => requestIdRef.current !== requestId;
+    if (mode === "text" ? !trimmedText : !imageFile || imageValidationError) return;
 
-    if (mode === "text") {
-      if (!trimmedText) return;
-      submittingRef.current = true;
-      setError(null);
-      clearResult();
-      setStage("analyzing");
-      try {
-        const outcome = await analyzeRawText(trimmedText, "text");
-        if (!isStale()) {
+    // Invalida cualquier análisis anterior (aborta su fetch, limpia su
+    // estado) y arranca inmediatamente la generación nueva sobre la que
+    // corre este análisis — nada espera a que la respuesta vieja llegue.
+    invalidateActiveRequest();
+    const requestId = generationRef.current;
+    const controller = new AbortController();
+    activeRequestRef.current = { id: requestId, controller };
+    const isActive = () => generationRef.current === requestId;
+
+    submittingRef.current = true;
+    setStage(mode === "text" ? "analyzing" : "reading");
+
+    try {
+      if (mode === "text") {
+        const outcome = await analyzeRawText(trimmedText, "text", controller.signal);
+        if (isActive()) {
           setResult(outcome.result);
           setCheckId(outcome.checkId);
         }
-      } catch (err) {
-        if (!isStale()) {
-          setError(err instanceof AnalyzeError ? err.message : "Ocurrió un error inesperado. Probá de nuevo.");
+      } else {
+        const base64 = await fileToBase64(imageFile!);
+        // fileToBase64 no es abortable (lectura local, no red) — se
+        // comprueba la generación antes de gastar una llamada real de OCR.
+        if (!isActive()) return;
+        const rawText = await extractTextFromImage(base64, imageFile!.type as ImageMimeType, controller.signal);
+        if (!isActive()) return;
+        setStage("analyzing");
+        const outcome = await analyzeRawText(rawText, "image_ocr", controller.signal);
+        if (isActive()) {
+          setResult(outcome.result);
+          setCheckId(outcome.checkId);
         }
-      } finally {
-        submittingRef.current = false;
-        if (!isStale()) setStage("idle");
-      }
-      return;
-    }
-
-    if (!imageFile || imageValidationError) return;
-    submittingRef.current = true;
-    setError(null);
-    clearResult();
-    setStage("reading");
-    try {
-      const base64 = await fileToBase64(imageFile);
-      const rawText = await extractTextFromImage(base64, imageFile.type as ImageMimeType);
-      if (isStale()) return;
-      setStage("analyzing");
-      const outcome = await analyzeRawText(rawText, "image_ocr");
-      if (!isStale()) {
-        setResult(outcome.result);
-        setCheckId(outcome.checkId);
       }
     } catch (err) {
-      if (!isStale()) {
+      const isAbort = err instanceof DOMException && err.name === "AbortError";
+      if (isActive() && !isAbort) {
         setError(
           err instanceof AnalyzeError || err instanceof FileReadError
             ? err.message
@@ -138,8 +173,16 @@ export function Analyzer() {
         );
       }
     } finally {
-      submittingRef.current = false;
-      if (!isStale()) setStage("idle");
+      // Ownership del finally: solo esta request, si sigue siendo la
+      // vigente, puede liberar el guard/controller y volver a "idle". Si ya
+      // fue invalidada (por una edición o por un análisis B posterior), su
+      // finally no toca nada — B (o el estado limpio que dejó la
+      // invalidación) sigue exactamente como estaba.
+      if (isActive()) {
+        submittingRef.current = false;
+        setStage("idle");
+        activeRequestRef.current = null;
+      }
     }
   }
 
@@ -174,7 +217,8 @@ export function Analyzer() {
           type="button"
           onClick={() => handleModeChange("text")}
           aria-pressed={mode === "text"}
-          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition ${
+          disabled={alertSending}
+          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
             mode === "text"
               ? "border-purple-600 bg-purple-600 text-white"
               : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
@@ -186,7 +230,8 @@ export function Analyzer() {
           type="button"
           onClick={() => handleModeChange("image")}
           aria-pressed={mode === "image"}
-          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition ${
+          disabled={alertSending}
+          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
             mode === "image"
               ? "border-purple-600 bg-purple-600 text-white"
               : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
@@ -208,8 +253,9 @@ export function Analyzer() {
               onChange={(e) => handleTextChange(e.target.value)}
               maxLength={MAX_LENGTH}
               rows={8}
+              disabled={alertSending}
               placeholder='Ej: "Su tarjeta fue bloqueada. Ingrese ahora a este enlace y confirme su clave para reactivarla."'
-              className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base leading-relaxed text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
+              className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base leading-relaxed text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
             />
             <div className="mt-1 text-right text-sm text-gray-500 dark:text-gray-400">
               {text.length}/{MAX_LENGTH}
@@ -221,7 +267,7 @@ export function Analyzer() {
             onFileChange={handleImageFileChange}
             error={imageValidationError}
             onErrorChange={setImageValidationError}
-            disabled={stage !== "idle"}
+            disabled={stage !== "idle" || alertSending}
           />
         )}
 

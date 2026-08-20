@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useFamilyContacts } from "../lib/useFamilyContacts";
+import { useAlertSending } from "../lib/useAlertSending";
 import { ContactsError, MAX_NOMBRE_LENGTH, MAX_EMAIL_LENGTH } from "../lib/contacts";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -10,8 +11,14 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // refetch. La sección expone un id/heading enfocable (#family-contacts,
 // #family-contacts-heading) para que "Agregar un contacto" en FamilyAlert
 // pueda desplazarse y mover el foco acá cuando no hay contactos todavía.
+//
+// Corrección 7B.1: mientras hay un envío de alerta real en vuelo
+// (alertSending, compartido con Analyzer/FamilyAlert/logout), el alta y la
+// baja de contactos quedan bloqueadas — no tendría sentido borrar el
+// contacto al que se le está mandando un email en ese mismo instante.
 export function FamilyContacts() {
   const { contacts, loading: listLoading, error: listError, addContact, removeContact } = useFamilyContacts();
+  const { alertSending } = useAlertSending();
 
   const [nombre, setNombre] = useState("");
   const [email, setEmail] = useState("");
@@ -24,7 +31,7 @@ export function FamilyContacts() {
 
   async function handleAdd(e: FormEvent) {
     e.preventDefault();
-    if (addLoading) return;
+    if (addLoading || alertSending) return;
 
     const trimmedNombre = nombre.trim();
     const trimmedEmail = email.trim();
@@ -64,7 +71,7 @@ export function FamilyContacts() {
   }
 
   async function handleDelete(id: string) {
-    if (deletingId) return;
+    if (deletingId || alertSending) return;
     setDeletingId(id);
     setDeleteError(null);
     try {
@@ -125,16 +132,16 @@ export function FamilyContacts() {
                   <button
                     type="button"
                     onClick={() => handleDelete(c.id)}
-                    disabled={deletingId === c.id}
-                    className="rounded-lg bg-red-600 px-3 py-1.5 font-medium text-white hover:bg-red-700 disabled:opacity-60"
+                    disabled={deletingId === c.id || alertSending}
+                    className="rounded-lg bg-red-600 px-3 py-1.5 font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {deletingId === c.id ? "Eliminando..." : "Sí, eliminar"}
                   </button>
                   <button
                     type="button"
                     onClick={() => setConfirmDeleteId(null)}
-                    disabled={deletingId === c.id}
-                    className="rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                    disabled={deletingId === c.id || alertSending}
+                    className="rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
                   >
                     Cancelar
                   </button>
@@ -143,7 +150,8 @@ export function FamilyContacts() {
                 <button
                   type="button"
                   onClick={() => setConfirmDeleteId(c.id)}
-                  className="shrink-0 rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                  disabled={alertSending}
+                  className="shrink-0 rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
                 >
                   Eliminar
                 </button>
@@ -173,8 +181,8 @@ export function FamilyContacts() {
             value={nombre}
             onChange={(e) => setNombre(e.target.value)}
             maxLength={MAX_NOMBRE_LENGTH}
-            disabled={addLoading}
-            className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
+            disabled={addLoading || alertSending}
+            className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
           />
         </div>
 
@@ -188,14 +196,14 @@ export function FamilyContacts() {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             maxLength={MAX_EMAIL_LENGTH}
-            disabled={addLoading}
-            className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
+            disabled={addLoading || alertSending}
+            className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
           />
         </div>
 
         <button
           type="submit"
-          disabled={addLoading}
+          disabled={addLoading || alertSending}
           className="w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
         >
           {addLoading ? "Agregando..." : "Agregar contacto"}
