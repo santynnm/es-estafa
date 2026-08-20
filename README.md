@@ -916,12 +916,13 @@ en profundidad). Estados, en orden:
 análisis visible en pantalla — ver la corrección 7B.1 (`Analyzer.tsx`) para el mecanismo
 exacto que lo garantiza incluso ante requests concurrentes.
 
-### Invalidación generacional y aborto real (corrección 7B.1)
+### Invalidación generacional y aborto del cliente (corrección 7B.1, aclarada en 7B.2)
 
 Antes de 7B.1, un `requestIdRef` simple descartaba respuestas obsoletas por número de
-generación, pero **no cancelaba el `fetch` en curso** — la request vieja seguía viva de
-fondo, gastando cuota real de Gemini/Brevo sin necesidad, y su `finally` podía competir
-con el de una request más nueva. 7B.1 corrige ambas cosas:
+generación, pero nunca le avisaba al navegador que dejara de esperar el `fetch` en
+curso — la conexión seguía abierta del lado del cliente sin necesidad, y el `finally`
+de esa request vieja podía competir con el de una request más nueva. 7B.1 agrega un
+`AbortController` real para lo primero y un mecanismo de "ownership" para lo segundo:
 
 - **`generationRef`** (contador monotónico) identifica "el análisis vigente". Cada
   invalidación lo incrementa de inmediato — nunca se posterga.
@@ -938,13 +939,26 @@ con el de una request más nueva. 7B.1 corrige ambas cosas:
   cerrar sesión, ya que eso desmonta `Analyzer`) — este último NUNCA llama a `setState`,
   solo aborta, para no generar el warning de React por actualizar un componente ya
   desmontado.
-- **Ni el contador solo, ni el abort solo, alcanzan**: un abort real corta el `fetch` de
-  verdad (ahorra cuota), pero una promesa ya resuelta (o, en los tests, un mock que
-  ignora el signal) puede seguir llegando a su `then`/`catch`/`finally` de todas formas
-  — por eso cada callback asíncrono compara su propio `requestId` contra
-  `generationRef.current` (`isActive()`) **antes** de tocar cualquier estado, incluso
-  después de un `await` a `fileToBase64()` (no abortable, por ser lectura local) antes
-  de gastar una llamada real de OCR.
+- **Qué garantiza `AbortController.abort()` y qué NO** (aclarado en 7B.2, sin cambiar
+  código): cancela la espera desde la perspectiva del navegador (el `fetch()` del
+  cliente se rechaza con `AbortError`), permite que la UI se libere y arranque otro
+  análisis de inmediato, y puede notificarle a la infraestructura de red que la
+  conexión se cerró. **No** garantiza que Vercel detenga la función serverless que ya
+  estaba corriendo, **no** garantiza cancelar una llamada a Gemini que el backend ya
+  había iniciado, y **no** garantiza evitar el consumo de esa cuota — `api/analyze.ts`
+  puede terminar de procesar igual y persistir un `check` en Supabase que este cliente
+  ya descartó. Brevo **no participa** en ningún momento de este flujo (análisis/OCR);
+  solo entra en juego después, cuando el usuario confirma `/api/send-alert`
+  explícitamente (ver la sección de arriba). Por eso `abort()` es una optimización del
+  ciclo de vida del lado del cliente, no una cancelación distribuida garantizada.
+- **La protección real contra un resultado obsoleto no es el abort**: es la
+  combinación de generación + `isActive()` + ownership del `finally`, descritos abajo.
+  Una promesa que YA se había resuelto del lado del servidor (o, en los tests, un mock
+  que ignora el signal) puede seguir llegando al `then`/`catch`/`finally` del cliente
+  de todas formas, abortada o no — por eso cada callback asíncrono compara su propio
+  `requestId` contra `generationRef.current` (`isActive()`) **antes** de tocar
+  cualquier estado, incluso después de un `await` a `fileToBase64()` (no abortable, por
+  ser lectura local) y antes de iniciar una nueva llamada de OCR.
 - **Ownership del `finally`**: solo la request que sigue siendo la vigente
   (`isActive()` verdadero en ese momento) puede liberar `submittingRef`, volver a
   `"idle"` y limpiar `activeRequestRef`. La request vieja, aunque su `finally` se ejecute

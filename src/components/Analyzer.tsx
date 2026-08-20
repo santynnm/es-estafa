@@ -48,12 +48,30 @@ export function Analyzer() {
   // nuevo, desmontaje) lo incrementa de inmediato. activeRequestRef guarda
   // el AbortController de la request en vuelo (si hay una) junto con el id
   // de generación que tenía cuando arrancó. Ninguno de los dos alcanza por
-  // sí solo: el AbortController corta el fetch de verdad, pero una promesa
-  // ya resuelta (o un mock de test que ignora el signal) puede seguir
-  // llegando al then/catch/finally igual — por eso cada callback async
-  // compara su propio requestId contra generationRef.current (isActive())
-  // antes de tocar cualquier estado. Y el contador solo sin abortar
-  // dejaría el fetch real corriendo de fondo sin necesidad.
+  // sí solo:
+  //
+  // - AbortController.abort() cancela la espera desde la perspectiva del
+  //   navegador (el fetch() del cliente se rechaza con AbortError) y puede
+  //   notificarle a la infraestructura de red que la conexión se cerró —
+  //   pero NO garantiza que Vercel detenga la función serverless en curso,
+  //   ni que se cancele una llamada a Gemini que el backend ya inició, ni
+  //   que se evite el consumo de esa cuota. api/analyze.ts puede terminar
+  //   de todas formas y persistir un `check` en Supabase que este cliente
+  //   ya descartó — eso es una limitación conocida y aceptada, no algo que
+  //   este mecanismo resuelva.
+  // - Por eso una promesa que YA estaba resuelta del lado del servidor (o,
+  //   en los tests, un mock que ignora el signal) puede seguir llegando al
+  //   then/catch/finally del cliente igual, abortada o no — por eso cada
+  //   callback async compara su propio requestId contra
+  //   generationRef.current (isActive()) antes de tocar cualquier estado:
+  //   esa comparación, no el abort, es la garantía real de que un
+  //   resultado obsoleto nunca se muestre.
+  //
+  // En resumen: abort() es una optimización de ciclo de vida del lado del
+  // cliente (deja de esperar, libera la UI, puede ahorrar tráfico de red),
+  // no una cancelación distribuida garantizada. La única garantía real
+  // contra resultados obsoletos es generación + isActive() + ownership del
+  // finally (ver más abajo).
   const generationRef = useRef(0);
   const activeRequestRef = useRef<ActiveRequest | null>(null);
 
@@ -63,12 +81,13 @@ export function Analyzer() {
     !alertSending &&
     (mode === "text" ? trimmedText.length > 0 : imageFile !== null && !imageValidationError);
 
-  // Única operación de invalidación: cancela lo que esté en vuelo (si hay
-  // algo) y deja el analizador en un estado limpio, listo para un análisis
-  // nuevo sin esperar la respuesta vieja. Se usa para los cinco disparadores
-  // de la sección A (editar texto, cambiar modo, cambiar/quitar imagen,
-  // iniciar un análisis nuevo, desmontar/cerrar sesión) — nunca se duplica
-  // esta lógica en otro lado.
+  // Única operación de invalidación: le pide al navegador que deje de
+  // esperar lo que esté en vuelo (si hay algo — abort(), sin garantía de
+  // cancelación server-side, ver más arriba) y deja al analizador en un
+  // estado limpio, listo para un análisis nuevo sin esperar esa respuesta.
+  // Se usa para los cinco disparadores de la sección A (editar texto,
+  // cambiar modo, cambiar/quitar imagen, iniciar un análisis nuevo,
+  // desmontar/cerrar sesión) — nunca se duplica esta lógica en otro lado.
   function invalidateActiveRequest() {
     generationRef.current += 1;
     const current = activeRequestRef.current;
@@ -105,10 +124,12 @@ export function Analyzer() {
     if (alertSending) return;
     setText(value);
     // Siempre invalida (no solo cuando ya hay result): también limpia un
-    // error de un intento anterior que quedó colgado sin resultado, y
-    // corta cualquier análisis en vuelo — es barato llamarla de más,
-    // React no re-renderiza por setear un estado al mismo valor que ya
-    // tenía.
+    // error de un intento anterior que quedó colgado sin resultado, y le
+    // avisa al fetch en vuelo (si hay uno) que el cliente dejó de esperar
+    // su respuesta — sin garantía de que el análisis server-side se
+    // detenga (ver el comentario junto a generationRef más arriba). Es
+    // barato llamarla de más: React no re-renderiza por setear un estado
+    // al mismo valor que ya tenía.
     invalidateActiveRequest();
   }
 

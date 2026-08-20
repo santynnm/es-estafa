@@ -46,11 +46,16 @@ function extractErrorMessage(data: unknown): string {
 // headers propios (X-Check-ID, Retry-After) sin duplicar el fetch.
 //
 // Acepta un AbortSignal opcional (corrección 7B.1): Analyzer lo usa para
-// cortar de verdad un análisis/OCR en curso cuando el usuario invalida esa
-// request (edita el input, cambia de modo/imagen, dispara un análisis
-// nuevo). Un abort deliberado se relanza tal cual (DOMException
-// "AbortError"), sin envolverlo en AnalyzeError — así el caller puede
-// distinguirlo de un error de red real y no mostrar ningún mensaje.
+// que el navegador deje de esperar un análisis/OCR en curso cuando el
+// usuario invalida esa request (edita el input, cambia de modo/imagen,
+// dispara un análisis nuevo). Esto corta la espera del lado del cliente
+// (y puede ahorrar tráfico de red), pero no garantiza que el backend deje
+// de procesar la request ni que se evite el consumo de cuota de Gemini —
+// api/analyze.ts puede terminar igual y persistir el check correspondiente
+// (ver el comentario junto a generationRef en Analyzer.tsx). Un abort
+// deliberado se relanza tal cual (DOMException "AbortError"), sin
+// envolverlo en AnalyzeError — así el caller puede distinguirlo de un
+// error de red real y no mostrar ningún mensaje.
 async function postJsonRaw(url: string, payload: unknown, signal?: AbortSignal): Promise<{ data: unknown; response: Response }> {
   const { data: sessionData } = await supabase.auth.getSession();
   const accessToken = sessionData.session?.access_token;
