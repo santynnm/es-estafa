@@ -10,11 +10,23 @@ type SendOutcome =
   | { kind: "in_progress" }
   | { kind: "error"; message: string };
 
+// Corrección Día 8B: el scroll programático (a diferencia de las
+// transiciones CSS, ya cubiertas en src/index.css) no queda acotado por la
+// media query — hay que consultar prefers-reduced-motion en el momento de
+// la acción y elegir "auto" en vez de "smooth" cuando está activa. Se lee
+// una sola vez acá (sin listener global ni estado React) porque esta
+// función solo importa al momento puntual del click. focus({preventScroll:
+// true}) evita que el foco dispare un segundo scroll (Chrome/Firefox
+// desplazan el elemento enfocado a la vista por defecto si no se lo pide
+// explícitamente) — el scrollIntoView de arriba ya deja el heading donde
+// corresponde, así que ese segundo scroll sería redundante y, peor,
+// siempre animado por defecto sin importar la preferencia del usuario.
 function focusFamilyContacts() {
   const heading = document.getElementById("family-contacts-heading");
   if (!heading) return;
-  heading.scrollIntoView({ behavior: "smooth", block: "start" });
-  heading.focus();
+  const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  heading.scrollIntoView({ behavior: prefersReducedMotion ? "auto" : "smooth", block: "start" });
+  heading.focus({ preventScroll: true });
 }
 
 // Flujo visible "Avisarle a un familiar" (Día 7B). Vive junto al resultado
