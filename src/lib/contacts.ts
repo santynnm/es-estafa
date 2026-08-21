@@ -25,7 +25,7 @@ export const MAX_EMAIL_LENGTH = 320;
 // de "demasiado largo" dentro de un mismo constraint combinado.
 function translateContactsError(error: PostgrestError, attempted: { nombre: string; email: string }): string {
   if (error.code === "23505") {
-    return "Ya tenés un contacto guardado con ese email.";
+    return "Ya tenés una persona guardada con ese email.";
   }
   if (error.code === "23514") {
     if (error.message.includes("family_contacts_email_format")) {

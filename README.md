@@ -1181,6 +1181,92 @@ a Supabase, Gemini o Brevo durante esta verificación):
   automático (una sola llamada real a `/api/send-alert` en 4s de espera).
 - `npm run build`, `npm run typecheck` y `npm run lint` sin errores ni warnings.
 
+## Navegación principal y "Personas de confianza" (corrección previa al Día 9)
+
+Corrección de UX puramente de presentación y navegación — sin funciones nuevas, sin cambios
+al backend, a `shared/classifierContract.ts`, a la tabla `family_contacts` ni al resto del
+modelo de datos. Dos cambios relacionados:
+
+**1. Navegación principal.** "Contactos familiares" vivía enterrado debajo del analizador,
+separado solo por una línea gruesa. Ahora hay una navegación de dos pestañas ("Analizar un
+mensaje" / "Personas de confianza") inmediatamente debajo de la barra de cuenta, no flotante
+ni sticky:
+
+- Estado centralizado en `src/lib/NavigationProvider.tsx` (`activeSection`, expuesto vía
+  `useNavigation()`) — ni `App`, ni `Analyzer`, ni `FamilyAlert` guardan su propio estado de
+  sección.
+- Patrón ARIA de pestañas con activación automática (`src/components/MainNav.tsx`):
+  `role="tablist"`/`role="tab"`/`role="tabpanel"`, `aria-selected`, `aria-controls` /
+  `aria-labelledby`, roving `tabindex`. Tab entra/sale del grupo, flechas izquierda/derecha
+  mueven el foco y activan la sección (Enter/Espacio funcionan solos por ser `<button>`
+  nativos), `focus-visible` en ambas pestañas.
+- **Ambos paneles quedan siempre montados** (`App.tsx`, atributo `hidden` nativo, no una
+  clase) — cambiar de sección nunca desmonta `Analyzer` ni `FamilyContacts`, así que texto
+  escrito, imagen seleccionada, resultado, `check_id` y el estado del selector de alerta
+  sobreviven un ida y vuelta sin refetch ni requests nuevas.
+- El contador ("Personas de confianza (2)") lee la misma lista compartida
+  (`FamilyContactsProvider`) y solo se muestra una vez que cargó — nunca un número
+  potencialmente engañoso mientras está cargando.
+- Mientras `alertSending` es `true` (un envío de alerta real en vuelo), ambas pestañas quedan
+  deshabilitadas — la guarda vive en `switchSection()` (no solo en el atributo `disabled`), así
+  que un evento sintético directo sobre los controles tampoco cambia de sección.
+- `focusFamilyContacts()` (el helper de Día 8B que hacía `scrollIntoView` + `focus` respetando
+  `prefers-reduced-motion`) se eliminó como función standalone — código muerto una vez que
+  "ir a contactos" pasa a ser un cambio de sección, no un scroll dentro de la misma página. El
+  mecanismo (scroll condicional + foco accesible, sin debilitar `prefers-reduced-motion`) se
+  reubicó dentro de `FamilyContacts.tsx`, disparado por un token centralizado
+  (`contactsFocusRequestToken`) que `FamilyAlert` incrementa vía
+  `switchSection("contacts", { focusPanelHeading: true })` cuando no hay personas guardadas.
+
+**2. Terminología "Personas de confianza".** Solo texto visible — la tabla `family_contacts`,
+el componente `FamilyContacts`, `FamilyAlert` y el resto del modelo interno no cambiaron de
+nombre:
+
+- "Contactos familiares" → "Personas de confianza"; "Avisarle a un familiar" → "Avisar a una
+  persona de confianza"; "Agregar un contacto" → "Agregar una persona"; mensajes de error y
+  estados relacionados ("Ya tenés una persona guardada con ese email.", etc.) siguen la misma
+  terminología.
+- La sección "Personas de confianza" explica, antes de la lista o el formulario, para qué se
+  guardan (avisar por email en riesgo medio/alto, nunca automáticamente) y qué recibe esa
+  persona (un resumen del riesgo, nunca el mensaje o la captura original).
+- El formulario de alta empieza oculto: un botón "Agregar una persona" lo despliega y mueve el
+  foco al campo de nombre (sin scroll animado forzado); "Cancelar" lo cierra sin ninguna
+  request. Un alta exitosa muestra una confirmación accesible (`role="status"`) además de
+  reflejarse en la lista y en el contador de la navegación.
+- En `FamilyAlert`, antes de la confirmación de envío se explicita que ningún envío es
+  automático y qué información viaja (o no) en el email — sin tocar `/api/send-alert`, que ya
+  omite `raw_text`.
+
+**Verificación realizada** (Playwright, con Supabase Auth/REST, `/api/analyze`,
+`/api/extract-image` y `/api/send-alert` interceptados — cero llamadas reales a Supabase,
+Gemini o Brevo):
+
+- Sección inicial "Analizar un mensaje"; navegación debajo de la barra de cuenta; semántica de
+  pestañas (`role`/`aria-*`) correcta; nombre accesible del grupo.
+- Teclado: Tab, ArrowLeft/ArrowRight (foco + activación coherentes), Enter y Espacio.
+- Preservación de estado al cambiar de sección y volver: texto escrito, resultado de riesgo
+  alto, selección de contacto y confirmación de envío en curso — todos intactos, sin requests
+  nuevas a Supabase/`/api/analyze`/`/api/extract-image`/`/api/send-alert`.
+- Contador: aparece recién cargada la lista, se actualiza a `(1)` tras un alta sin refetch (un
+  solo `GET` de contactos en toda la sesión de prueba).
+- Estado vacío con el texto requerido; formulario colapsado por defecto; foco en el nombre al
+  abrir; "Cancelar" sin request; alta exitosa limpia y cierra el formulario y muestra la
+  confirmación accesible.
+- Riesgo bajo sin CTA de alerta; medio/alto con CTA, sin contacto preseleccionado, con la
+  explicación de "nunca automático" y de qué información se envía.
+- Sin personas guardadas: "Agregar una persona" cambia de sección y mueve el foco al heading,
+  respetando `prefers-reduced-motion` (`"auto"` vs `"smooth"`) en ambos casos.
+- Confirmación de envío con nombre/email exactos; "Cancelar" sin request; doble clic en
+  "Confirmar envío" generó exactamente una request a `/api/send-alert`.
+- Durante un envío en curso: ambas pestañas deshabilitadas (atributo y guarda en el handler,
+  verificado con un evento sintético directo); "Cerrar sesión" también sigue bloqueado
+  (regresión 7B.1); todo se reactiva tras la respuesta.
+- Responsive en 320/375/768/1440px sin overflow horizontal (incluyendo nombre/email
+  deliberadamente largos), pestañas ≥44×44px; modo claro y oscuro renderizando sin errores.
+- Regresión de concurrencia (7B.1): una request vieja que resuelve tarde después de haber sido
+  invalidada (`AbortController` + `isActive()`) nunca pisa el resultado nuevo.
+- `npm run build`, `npm run typecheck`, `npm run lint` y `git diff --check` sin errores.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

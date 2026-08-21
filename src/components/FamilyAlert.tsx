@@ -3,31 +3,13 @@ import type { RiskLevel } from "../../shared/classifierContract";
 import { sendFamilyAlert, AlertSendError } from "../lib/api";
 import { useFamilyContacts } from "../lib/useFamilyContacts";
 import { useAlertSending } from "../lib/useAlertSending";
+import { useNavigation } from "../lib/useNavigation";
 
 type SendOutcome =
   | { kind: "sent"; contactName: string }
   | { kind: "already_sent" }
   | { kind: "in_progress" }
   | { kind: "error"; message: string };
-
-// Corrección Día 8B: el scroll programático (a diferencia de las
-// transiciones CSS, ya cubiertas en src/index.css) no queda acotado por la
-// media query — hay que consultar prefers-reduced-motion en el momento de
-// la acción y elegir "auto" en vez de "smooth" cuando está activa. Se lee
-// una sola vez acá (sin listener global ni estado React) porque esta
-// función solo importa al momento puntual del click. focus({preventScroll:
-// true}) evita que el foco dispare un segundo scroll (Chrome/Firefox
-// desplazan el elemento enfocado a la vista por defecto si no se lo pide
-// explícitamente) — el scrollIntoView de arriba ya deja el heading donde
-// corresponde, así que ese segundo scroll sería redundante y, peor,
-// siempre animado por defecto sin importar la preferencia del usuario.
-function focusFamilyContacts() {
-  const heading = document.getElementById("family-contacts-heading");
-  if (!heading) return;
-  const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  heading.scrollIntoView({ behavior: prefersReducedMotion ? "auto" : "smooth", block: "start" });
-  heading.focus({ preventScroll: true });
-}
 
 // Flujo visible "Avisarle a un familiar" (Día 7B). Vive junto al resultado
 // de un análisis con riesgo medio/alto — el padre (Analyzer) es responsable
@@ -45,6 +27,7 @@ function focusFamilyContacts() {
 export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel: RiskLevel }) {
   const { contacts, loading, error: contactsError, reload } = useFamilyContacts();
   const { alertSending, setAlertSending } = useAlertSending();
+  const { switchSection } = useNavigation();
 
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
@@ -141,7 +124,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
       >
         {outcome.kind === "sent"
           ? `Alerta enviada a ${outcome.contactName}.`
-          : "Ya se había enviado una alerta a este contacto para este análisis."}
+          : "Ya se había enviado una alerta a esta persona para este análisis."}
       </div>
     );
   }
@@ -149,7 +132,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
   if (loading) {
     return (
       <p role="status" aria-live="polite" className="mt-4 text-base text-gray-600 dark:text-gray-400">
-        Cargando contactos...
+        Cargando personas de confianza...
       </p>
     );
   }
@@ -160,7 +143,10 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         role="alert"
         className="mt-4 rounded-xl border-2 border-red-300 bg-red-50 p-4 text-base text-red-900 dark:border-red-700 dark:bg-red-950 dark:text-red-100"
       >
-        <p>No se pudo cargar tu lista de contactos, así que no podemos ofrecerte avisarle a nadie todavía.</p>
+        <p>
+          No se pudo cargar tu lista de personas de confianza, así que no podemos ofrecerte avisarle a
+          nadie todavía.
+        </p>
         <div className="mt-3 flex flex-wrap gap-2">
           <button
             type="button"
@@ -171,10 +157,10 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
           </button>
           <button
             type="button"
-            onClick={focusFamilyContacts}
+            onClick={() => switchSection("contacts", { focusPanelHeading: true })}
             className="inline-flex min-h-11 items-center rounded-lg border border-red-400 px-3 font-medium text-red-900 transition hover:bg-red-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600 dark:border-red-600 dark:text-red-100 dark:hover:bg-red-900"
           >
-            Ir a contactos
+            Ir a personas de confianza
           </button>
         </div>
       </div>
@@ -186,13 +172,13 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
   if (!hasContacts) {
     return (
       <div className="mt-4 rounded-xl border-2 border-dashed border-gray-300 p-4 text-base text-gray-700 dark:border-gray-700 dark:text-gray-300">
-        <p>Primero agregá al menos un contacto familiar.</p>
+        <p>Primero agregá al menos una persona de confianza.</p>
         <button
           type="button"
-          onClick={focusFamilyContacts}
+          onClick={() => switchSection("contacts", { focusPanelHeading: true })}
           className="mt-3 inline-flex min-h-11 items-center rounded-lg bg-purple-600 px-4 font-semibold text-white transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800"
         >
-          Agregar un contacto
+          Agregar una persona
         </button>
       </div>
     );
@@ -208,7 +194,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
           aria-disabled={alertSending}
           className="min-h-11 w-full rounded-xl border-2 border-purple-600 bg-white px-6 py-4 text-lg font-bold text-purple-700 shadow-sm transition hover:bg-purple-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-gray-900 dark:text-purple-300 dark:hover:bg-gray-800"
         >
-          Avisarle a un familiar
+          Avisar a una persona de confianza
         </button>
       </div>
     );
@@ -216,8 +202,17 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
 
   return (
     <div className="mt-4 rounded-xl border-2 border-purple-300 bg-purple-50 p-4 dark:border-purple-700 dark:bg-purple-950">
-      <label htmlFor="family-alert-contact" className="block text-base font-semibold text-gray-900 dark:text-gray-100">
-        Elegí un contacto
+      <p className="text-sm text-purple-900 dark:text-purple-100">
+        Nunca enviamos alertas automáticamente: vos elegís a quién avisar y confirmás cada envío. Le
+        llegará un resumen del riesgo detectado y las señales encontradas — nunca el mensaje o la
+        captura original.
+      </p>
+
+      <label
+        htmlFor="family-alert-contact"
+        className="mt-4 block text-base font-semibold text-gray-900 dark:text-gray-100"
+      >
+        Elegí una persona
       </label>
       <select
         id="family-alert-contact"
@@ -227,7 +222,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         className="mt-2 min-h-11 w-full rounded-xl border-2 border-gray-300 bg-white p-3 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
       >
         <option value="" disabled>
-          Seleccioná un contacto...
+          Seleccioná una persona...
         </option>
         {contacts!.map((c) => (
           <option key={c.id} value={c.id}>
@@ -239,12 +234,13 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
       {selectedContact && (
         <div className="mt-4">
           <p className="break-words text-base text-gray-900 dark:text-gray-100">
-            Se enviará una alerta a <strong>{selectedContact.nombre}</strong> ({selectedContact.email}).
+            Vas a enviar una alerta a <strong>{selectedContact.nombre}</strong> ({selectedContact.email}).
+            ¿Querés continuar?
           </p>
 
           {outcome?.kind === "in_progress" && (
             <p role="status" aria-live="polite" className="mt-2 text-base text-amber-800 dark:text-amber-300">
-              Ya hay un envío en curso para este contacto. Esperá un momento y volvé a intentar.
+              Ya hay un envío en curso para esta persona. Esperá un momento y volvé a intentar.
             </p>
           )}
           {outcome?.kind === "error" && (

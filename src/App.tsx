@@ -3,9 +3,12 @@ import { useAuth } from "./lib/useAuth";
 import { supabase } from "./lib/supabaseClient";
 import { FamilyContactsProvider } from "./lib/FamilyContactsProvider";
 import { AlertSendingContext } from "./lib/alertSendingContextDef";
+import { NavigationProvider } from "./lib/NavigationProvider";
+import { useNavigation } from "./lib/useNavigation";
 import { AuthScreen } from "./components/AuthScreen";
 import { Analyzer } from "./components/Analyzer";
 import { FamilyContacts } from "./components/FamilyContacts";
+import { MainNav } from "./components/MainNav";
 
 function LoadingScreen() {
   return (
@@ -58,6 +61,27 @@ function AccountBar({ email, alertSending }: { email: string; alertSending: bool
   );
 }
 
+// Ambos paneles quedan siempre montados (nunca se desmonta Analyzer ni
+// FamilyContacts al cambiar de sección) — así el texto escrito, la imagen
+// seleccionada, el resultado, el check_id y el estado del selector de
+// alerta sobreviven un ida y vuelta entre secciones sin necesitar levantar
+// ese estado a un componente superior. `hidden` (atributo nativo, no una
+// clase) saca el panel inactivo del árbol de accesibilidad y de la
+// disposición visual, sin desmontarlo.
+function Panels() {
+  const { activeSection } = useNavigation();
+  return (
+    <>
+      <div id="panel-analyze" role="tabpanel" aria-labelledby="tab-analyze" hidden={activeSection !== "analyze"}>
+        <Analyzer />
+      </div>
+      <div id="panel-contacts" role="tabpanel" aria-labelledby="tab-contacts" hidden={activeSection !== "contacts"}>
+        <FamilyContacts />
+      </div>
+    </>
+  );
+}
+
 function App() {
   const { session, loading } = useAuth();
   // Coordinación acotada (corrección 7B.1, sección D): true exactamente
@@ -89,15 +113,12 @@ function App() {
   return (
     <div className="min-h-svh bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
       <AlertSendingContext.Provider value={{ alertSending, setAlertSending }}>
-        <AccountBar email={session.user.email ?? ""} alertSending={alertSending} />
         <FamilyContactsProvider>
-          <Analyzer />
-          {/* Día 8B: separador visual fuerte antes de la sección secundaria
-              (gestión de contactos), para que se lea claramente distinta del
-              analizador — que sigue siendo la acción principal de la
-              pantalla. */}
-          <div className="mt-10 border-t-4 border-gray-200 dark:border-gray-800" />
-          <FamilyContacts />
+          <NavigationProvider>
+            <AccountBar email={session.user.email ?? ""} alertSending={alertSending} />
+            <MainNav />
+            <Panels />
+          </NavigationProvider>
         </FamilyContactsProvider>
       </AlertSendingContext.Provider>
     </div>

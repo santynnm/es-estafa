@@ -27,7 +27,7 @@ export function FamilyContactsProvider({ children }: { children: ReactNode }) {
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(err instanceof ContactsError ? err.message : "No se pudieron cargar los contactos.");
+          setError(err instanceof ContactsError ? err.message : "No se pudieron cargar las personas de confianza.");
         }
       })
       .finally(() => {
