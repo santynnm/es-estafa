@@ -11,12 +11,25 @@
 // demás casos son rechazos de validación propia de /api/analyze, que
 // responden antes de llamar a Gemini.
 //
+// Corrección puntual (post Día 8A): la elegibilidad y la limpieza de la fila
+// de prueba antes marcaban PASS sin comprobar nada real (falsos positivos).
+// Ahora la elegibilidad falla de verdad si risk_level no es "medio"/"alto",
+// y la limpieza corre siempre (try/finally, incluso si una comprobación
+// posterior al checkId falla), se verifica con una consulta posterior, y
+// cualquier fallo de borrado o de verificación cuenta como fallo real de la
+// evaluación (exit code distinto de cero).
+//
 // Uso:
 //   npm run eval:audio-readiness
 //   EVAL_BASE_URL=http://localhost:3000 npm run eval:audio-readiness   # contra vercel dev en local
+//
+// isEligibleForAlert y cleanupCheckRow se exportan para poder probarlos
+// localmente sin red (ver el comentario junto al guard de main() al final
+// del archivo) — no son un evaluador paralelo, son las mismas funciones que
+// usa main().
 
-import { createClient } from "@supabase/supabase-js";
-import { isClassifierResult, type ClassifierResult } from "../shared/classifierContract.ts";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { isClassifierResult, type ClassifierResult, type RiskLevel } from "../shared/classifierContract.ts";
 import { getEvalAccessToken } from "./evalAuth.mts";
 
 const BASE_URL = process.env.EVAL_BASE_URL || "https://codercup.vercel.app";
@@ -40,6 +53,11 @@ function section(title: string) {
   console.log(`\n${title}`);
 }
 
+function printSummary() {
+  console.log(`\n${failures === 0 ? "Todas las verificaciones pasaron." : `${failures} verificación(es) fallida(s).`}`);
+  if (failures > 0) process.exitCode = 1;
+}
+
 async function analyzeRequest(body: unknown, accessToken?: string) {
   const res = await fetch(`${BASE_URL}/api/analyze`, {
     method: "POST",
@@ -51,6 +69,47 @@ async function analyzeRequest(body: unknown, accessToken?: string) {
   });
   const data: unknown = await res.json().catch(() => null);
   return { status: res.status, headers: res.headers, data };
+}
+
+// Único criterio real de elegibilidad para esta evaluación: el caso
+// representativo fue elegido para producir riesgo medio o alto (llamada
+// suplantando al banco, pidiendo un código de SMS) — si el clasificador
+// devuelve "bajo" para ese caso, algo está mal (calibración regresionada o
+// caso mal elegido) y la evaluación tiene que fallar de verdad, no simular
+// un PASS. No reimplementa la lógica real de /api/send-alert (que además
+// depende de ownership/contacto/cupo) — solo el filtro por risk_level que
+// esa evaluación puede comprobar sin llamar al endpoint de alertas.
+export function isEligibleForAlert(riskLevel: RiskLevel): boolean {
+  return riskLevel === "medio" || riskLevel === "alto";
+}
+
+// Borra la fila de prueba con el cliente admin y confirma con una consulta
+// posterior que ya no existe — un DELETE de Supabase no es prueba suficiente
+// por sí solo (no falla si 0 filas coincidieron). Devuelve ok:false ante
+// cualquier error o si la fila sigue estando ahí, para que el caller lo
+// cuente como un fallo real en vez de solo loguearlo.
+export async function cleanupCheckRow(
+  admin: Pick<SupabaseClient, "from">,
+  checkId: string,
+): Promise<{ ok: boolean; detail: string }> {
+  const { error: deleteError } = await admin.from("checks").delete().eq("id", checkId);
+  if (deleteError) {
+    return { ok: false, detail: `error al eliminar la fila (id: ${checkId}): ${deleteError.message}` };
+  }
+
+  const { data: stillThere, error: verifyError } = await admin
+    .from("checks")
+    .select("id")
+    .eq("id", checkId)
+    .maybeSingle();
+  if (verifyError) {
+    return { ok: false, detail: `no se pudo verificar la eliminación (id: ${checkId}): ${verifyError.message}` };
+  }
+  if (stillThere) {
+    return { ok: false, detail: `la fila (id: ${checkId}) sigue existiendo después del DELETE` };
+  }
+
+  return { ok: true, detail: `fila (id: ${checkId}) eliminada y verificada ausente` };
 }
 
 async function main() {
@@ -134,8 +193,8 @@ async function main() {
 
   if (status !== 200) {
     fail("POST /api/analyze con audio_transcript -> 200", `status obtenido: ${status} :: ${JSON.stringify(data)}`);
-    console.log(`\n${failures} verificación(es) fallida(s). No se puede continuar sin una respuesta 200.`);
-    process.exitCode = 1;
+    console.log("\nNo se llegó a crear una fila (la request no devolvió 200) — no hay nada que limpiar.");
+    printSummary();
     return;
   }
   pass("POST /api/analyze con audio_transcript -> 200");
@@ -148,102 +207,112 @@ async function main() {
   const result = data as ClassifierResult;
 
   const checkId = headers.get("X-Check-ID");
-  if (checkId && UUID_PATTERN.test(checkId)) {
-    pass("X-Check-ID presente y con forma de UUID");
-  } else {
+  if (!checkId || !UUID_PATTERN.test(checkId)) {
     fail("X-Check-ID presente y con forma de UUID", `header obtenido: ${checkId}`);
-    console.log(`\n${failures} verificación(es) fallida(s). No se puede continuar sin un check_id válido.`);
-    process.exitCode = 1;
-    return;
-  }
-
-  section("Persistencia en `checks` (verificada con el cliente admin, fuera de RLS)");
-
-  interface CheckRow {
-    id: string;
-    user_id: string;
-    source_type: string;
-    raw_text: string;
-    risk_level: string;
-    signals: unknown;
-    explanation: string;
-    recommended_action: string;
-  }
-
-  const { data: row, error: rowError } = await admin
-    .from("checks")
-    .select("id, user_id, source_type, raw_text, risk_level, signals, explanation, recommended_action")
-    .eq("id", checkId)
-    .maybeSingle<CheckRow>();
-
-  if (rowError || !row) {
-    fail("la fila persistida existe y es legible", `error: ${rowError?.message ?? "(sin fila)"}`);
-    console.log(`\n${failures} verificación(es) fallida(s).`);
-    process.exitCode = 1;
-    return;
-  }
-  pass("la fila persistida existe y es legible");
-
-  if (row.user_id === user.id) {
-    pass("la fila pertenece al usuario de evaluación (ownership)");
-  } else {
-    fail("la fila pertenece al usuario de evaluación (ownership)", `user_id obtenido: ${row.user_id}`);
-  }
-
-  if (row.source_type === "audio_transcript") {
-    pass('source_type persistido es exactamente "audio_transcript" (no se degradó a "text")');
-  } else {
-    fail('source_type persistido es "audio_transcript"', `obtenido: ${row.source_type}`);
-  }
-
-  if (row.raw_text === REPRESENTATIVE_RAW_TEXT) {
-    pass("raw_text persistido coincide con el enviado");
-  } else {
-    fail("raw_text persistido coincide con el enviado", `obtenido: ${row.raw_text}`);
-  }
-
-  if (
-    isClassifierResult({
-      risk_level: row.risk_level,
-      signals: row.signals,
-      explanation: row.explanation,
-      recommended_action: row.recommended_action,
-    })
-  ) {
-    pass("el resultado persistido (risk_level/signals/explanation/recommended_action) es válido");
-  } else {
-    fail("el resultado persistido es válido", `fila: ${JSON.stringify(row)}`);
-  }
-
-  section("Elegibilidad para alerta (sin llamar a /api/send-alert, cero emails)");
-
-  const wouldBeEligible = row.risk_level !== "bajo";
-  console.log(
-    `  risk_level obtenido: "${row.risk_level}" -> ${
-      wouldBeEligible ? "sería elegible para una alerta (medio/alto)" : "no sería elegible (bajo)"
-    }.`,
-  );
-  console.log(
-    "  (No se llama a /api/send-alert en esta evaluación — la elegibilidad real depende únicamente de ownership, " +
-      "risk_level, contacto válido, idempotencia y cupo; ninguno de esos chequeos referencia source_type, ver api/send-alert.ts.)",
-  );
-  pass("inspección de elegibilidad completada sin invocar /api/send-alert");
-
-  section("Limpieza");
-
-  const { error: deleteError } = await admin.from("checks").delete().eq("id", checkId);
-  if (deleteError) {
     console.log(
-      `  No se pudo eliminar automáticamente la fila de prueba (id: ${checkId}). Queda documentada acá para` +
-        ` borrado manual si hace falta. Motivo: ${deleteError.message}`,
+      "\nUn 200 implica que /api/analyze insertó una fila antes de fallar al setear el header — puede haber " +
+        "quedado una fila sin identificador conocido por este script. Revisar manualmente en Supabase si hace falta.",
     );
-  } else {
-    console.log(`  Fila de prueba (id: ${checkId}) eliminada correctamente.`);
+    printSummary();
+    return;
+  }
+  pass("X-Check-ID presente y con forma de UUID");
+
+  // A partir de acá existe una fila de prueba real identificada por checkId.
+  // Todo lo que sigue corre en try/finally: si cualquier comprobación
+  // posterior lanza o falla, la limpieza tiene que ejecutarse igual — nunca
+  // debe quedar una fila de prueba sin intentar borrarla.
+  try {
+    section("Persistencia en `checks` (verificada con el cliente admin, fuera de RLS)");
+
+    interface CheckRow {
+      id: string;
+      user_id: string;
+      source_type: string;
+      raw_text: string;
+      risk_level: RiskLevel;
+      signals: unknown;
+      explanation: string;
+      recommended_action: string;
+    }
+
+    const { data: row, error: rowError } = await admin
+      .from("checks")
+      .select("id, user_id, source_type, raw_text, risk_level, signals, explanation, recommended_action")
+      .eq("id", checkId)
+      .maybeSingle<CheckRow>();
+
+    if (rowError || !row) {
+      fail("la fila persistida existe y es legible", `error: ${rowError?.message ?? "(sin fila)"}`);
+      return;
+    }
+    pass("la fila persistida existe y es legible");
+
+    if (row.user_id === user.id) {
+      pass("la fila pertenece al usuario de evaluación (ownership)");
+    } else {
+      fail("la fila pertenece al usuario de evaluación (ownership)", `user_id obtenido: ${row.user_id}`);
+    }
+
+    if (row.source_type === "audio_transcript") {
+      pass('source_type persistido es exactamente "audio_transcript" (no se degradó a "text")');
+    } else {
+      fail('source_type persistido es "audio_transcript"', `obtenido: ${row.source_type}`);
+    }
+
+    if (row.raw_text === REPRESENTATIVE_RAW_TEXT) {
+      pass("raw_text persistido coincide con el enviado");
+    } else {
+      fail("raw_text persistido coincide con el enviado", `obtenido: ${row.raw_text}`);
+    }
+
+    if (
+      isClassifierResult({
+        risk_level: row.risk_level,
+        signals: row.signals,
+        explanation: row.explanation,
+        recommended_action: row.recommended_action,
+      })
+    ) {
+      pass("el resultado persistido (risk_level/signals/explanation/recommended_action) es válido");
+    } else {
+      fail("el resultado persistido es válido", `fila: ${JSON.stringify(row)}`);
+    }
+
+    section("Elegibilidad para alerta (sin llamar a /api/send-alert, cero emails)");
+
+    if (isEligibleForAlert(row.risk_level)) {
+      pass(`risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`);
+    } else {
+      fail(
+        `risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`,
+        "el caso representativo fue elegido para producir riesgo medio o alto; un resultado \"bajo\" indica una " +
+          "regresión de calibración o un caso mal elegido, no una elegibilidad confirmada",
+      );
+    }
+    console.log(
+      "  (No se llama a /api/send-alert en esta evaluación — la elegibilidad real depende también de ownership, " +
+        "contacto válido, idempotencia y cupo; ninguno de esos chequeos referencia source_type, ver api/send-alert.ts.)",
+    );
+
+    console.log(`\nResultado del análisis clasificado: risk_level="${result.risk_level}", signals=${JSON.stringify(result.signals)}`);
+  } finally {
+    section("Limpieza");
+    const cleanup = await cleanupCheckRow(admin, checkId);
+    if (cleanup.ok) {
+      pass(cleanup.detail);
+    } else {
+      fail("fila de prueba eliminada y verificada ausente", cleanup.detail);
+    }
   }
 
-  console.log(`\nResultado del análisis clasificado: risk_level="${result.risk_level}", signals=${JSON.stringify(result.signals)}`);
-  console.log(`\n${failures === 0 ? "Todas las verificaciones pasaron." : `${failures} verificación(es) fallida(s).`}`);
-  if (failures > 0) process.exitCode = 1;
+  printSummary();
 }
 
-main();
+// Guard para poder importar isEligibleForAlert/cleanupCheckRow desde una
+// prueba local sin red (tsx -e "...") sin disparar main() — main() solo
+// corre cuando este archivo se ejecuta como script (npm run
+// eval:audio-readiness), nunca al importarlo.
+if (!process.env.AUDIO_READINESS_SKIP_MAIN) {
+  main();
+}
