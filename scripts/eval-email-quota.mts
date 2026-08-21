@@ -15,7 +15,8 @@
 //                                                   (Management API), solo en memoria:
 //                                                   nunca se escribe a archivo, nunca se
 //                                                   loguea, nunca aparece en errores.
-//   SUPABASE_PROJECT_REF                         — ref del proyecto (ej. xnuxsxjqxbzwupfkdzzv)
+//   SUPABASE_PROJECT_REF                         — ref del proyecto (visible en el dashboard
+//                                                   de Supabase o en VITE_SUPABASE_URL)
 //
 // Sin SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF el script no puede crear
 // el schema aislado ni comparar la función desplegada — lo informa
