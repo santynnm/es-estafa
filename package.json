@@ -12,6 +12,7 @@
     "eval": "tsx scripts/eval-classifier.mts",
     "eval:image": "tsx scripts/eval-image-pipeline.mts",
     "eval:quota": "tsx scripts/eval-email-quota.mts",
+    "eval:audio-readiness": "tsx scripts/eval-audio-readiness.mts",
     "preview": "vite preview"
   },
   "dependencies": {

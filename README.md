@@ -1011,6 +1011,128 @@ otro contacto o, peor, mostrar el texto de "ya se había enviado" en vez del éx
 Verificado: tras un envío exitoso, eliminar ese mismo contacto desde `FamilyContacts` no
 cambia ni borra el mensaje "Alerta enviada a [nombre]." ya mostrado.
 
+## Preparación para audio — Día 8A (audio todavía no implementado)
+
+Auditoría de extensibilidad (sección 14 de `indicaciones.md`), no una funcionalidad nueva:
+**no se agregó grabación, subida ni transcripción de audio**. El único objetivo era probar,
+en runtime y no solo a nivel de tipos, que una futura transcripción de audio puede entrar
+al sistema como `raw_text` normalizado sin reescribir el clasificador, la persistencia ni
+las alertas.
+
+### El camino futuro (todavía sin implementar)
+
+```
+Audio futuro (grabación de voz del usuario describiendo una llamada sospechosa)
+  → transcripción externa a texto (proveedor todavía no elegido; indicaciones.md
+    sugiere Whisper vía Groq, tier gratuito)
+  → { raw_text: string, source_type: "audio_transcript" }
+  → POST /api/analyze                              ← YA acepta este pathway
+  → mismo clasificador Gemini (api/_lib/gemini.ts + api/_lib/prompt.ts)  ← sin cambios
+  → mismo ClassifierResult (shared/classifierContract.ts)               ← sin cambios
+  → persistencia en checks, source_type = "audio_transcript"            ← ya soportado
+  → mismo header X-Check-ID                                             ← sin cambios
+  → misma elegibilidad para POST /api/send-alert                        ← sin cambios
+  → mismo ResultCard y FamilyAlert                                      ← sin cambios
+```
+
+### Qué se reutiliza tal cual (sin ningún cambio)
+
+- **`shared/classifierContract.ts`**: `SourceType` ya incluía `"audio_transcript"` desde
+  su diseño original. `ClassifierRequest`/`ClassifierResult` no tienen (ni necesitan) ningún
+  campo específico de audio — nunca viaja una URL, un blob, un MIME type, una duración ni
+  un archivo por este contrato, solo texto plano ya transcripto en otro lado.
+- **`api/_lib/prompt.ts` y `api/_lib/gemini.ts`**: el prompt y la llamada a Gemini analizan
+  `raw_text` sin ninguna referencia a de dónde vino ese texto. Un caso representativo de
+  transcripción ("Me llamaron diciendo que eran del banco y me pidieron el código que llegó
+  por SMS para evitar el bloqueo de mi cuenta.") se clasificó correctamente como riesgo alto
+  con señales concretas, sin necesitar ninguna rúbrica, prompt ni modelo distinto — ver
+  `scripts/eval-audio-readiness.mts`.
+- **`supabase/migrations/20260816224839_checks.sql`**: la columna `source_type` ya tenía el
+  `check` constraint `in ('text', 'image_ocr', 'audio_transcript')` desde que se creó la
+  tabla (Día 7A) — no hizo falta ninguna migración nueva. RLS (`checks_select_own`,
+  `checks_insert_own`) sigue aplicando igual sin importar el `source_type`.
+- **`api/send-alert.ts`**: la elegibilidad para una alerta depende únicamente de ownership
+  (RLS), `risk_level` medio/alto, contacto válido, idempotencia (`alerts_sent`) y cupo diario
+  — ninguna de esas verificaciones lee ni referencia `source_type` (la consulta a `checks`
+  ni siquiera selecciona esa columna). El email sigue siendo el resumen ya existente
+  (`risk_level`, señales, explicación, acción recomendada) — nunca `raw_text`, así que un
+  futuro `audio_transcript` tampoco cambia qué contenido se manda por correo.
+- **`ResultCard.tsx` y `FamilyAlert.tsx`**: ninguno de los dos lee `source_type` — funcionan
+  igual sin importar el origen del análisis.
+
+### La única incompatibilidad concreta encontrada (corregida)
+
+`api/analyze.ts` valida `source_type` en runtime contra
+`SUPPORTED_SOURCE_TYPES`, y esa lista, pensada originalmente solo para los orígenes ya
+habilitados desde el frontend, todavía no incluía `"audio_transcript"` — aunque el tipo
+TypeScript `SourceType` sí lo contemplaba. Un request real con
+`source_type: "audio_transcript"` habría sido rechazado con 400 pese a que el contrato
+declarado lo permitía. Se corrigió `SUPPORTED_SOURCE_TYPES` en
+`shared/classifierContract.ts` para incluir los tres valores (`"text"`, `"image_ocr"`,
+`"audio_transcript"`), y se actualizó el mensaje de error de `api/analyze.ts` para
+reflejarlo. Esto **no** habilita nada nuevo en el frontend — `FrontendSourceType` (ver
+abajo) sigue restringido a los dos orígenes reales.
+
+### El único adaptador nuevo que haría falta a futuro
+
+Cuando se implemente audio de verdad, el trabajo se limita a un adaptador nuevo del lado
+del frontend que:
+1. Grabe o reciba la voz del usuario (ej. un botón con `MediaRecorder`, no implementado).
+2. La transcriba a texto **fuera** del clasificador (proveedor todavía no elegido).
+3. Obtenga el texto plano transcripto.
+4. Llame a `analyzeRawText(transcript, "audio_transcript")`.
+5. Reutilice el resultado y el `X-Check-ID` exactamente igual que hoy hacen los modos texto
+   e imagen.
+
+### La frontera frontend (deliberadamente no tocada en este día)
+
+`src/lib/api.ts` define `FrontendSourceType = Extract<ClassifierRequest["source_type"],
+"text" | "image_ocr">` — un tipo angosto a propósito, distinto del `SourceType` completo del
+contrato, porque hoy el frontend solo puede originar esos dos valores. La firma de
+`analyzeRawText(rawText, sourceType: FrontendSourceType, signal?)` no compila si se le pasa
+`"audio_transcript"` tal cual está. Esto es intencional en esta etapa (no hay ningún control
+de audio en la UI) y **no se amplió** — el cambio mínimo futuro, cuando exista un adaptador
+real, sería ensanchar ese tipo (o agregar una función/overload específica) en ese único
+punto de `src/lib/api.ts`, sin tocar `Analyzer.tsx`, `ResultCard.tsx` ni `FamilyAlert.tsx`.
+Ningún botón, selector ni modo visible de audio se agregó a la UI en este día.
+
+### Límites de privacidad (vigentes ya, no nuevos)
+
+- No se graba, sube, procesa ni almacena audio real en esta etapa — cero bytes de audio en
+  ningún lado del sistema.
+- `checks` nunca guarda un archivo, blob, URL, MIME type ni duración — solo texto.
+- El proveedor de transcripción no está elegido todavía (indicaciones.md menciona Whisper
+  vía Groq como opción, sin comprometerse).
+- El email de alerta sigue sin incluir `raw_text` — un futuro `audio_transcript` tampoco
+  haría que el contenido transcripto viaje por email.
+
+### Qué NO se implementó en este día (explícitamente fuera de alcance)
+
+Botón de micrófono, `MediaRecorder`, permisos de micrófono, subida de archivos de audio,
+endpoint `/api/transcribe`, elección/integración de un proveedor de transcripción, llamadas
+a Gemini con bytes de audio, Supabase Storage para audio, cualquier columna o campo nuevo en
+`checks`, cambios en `ResultCard`/`FamilyAlert`, cambios en Brevo/cupos/contactos/auth/RLS.
+
+### Evaluación reproducible
+
+`scripts/eval-audio-readiness.mts` (`npm run eval:audio-readiness`) prueba el pathway
+completo contra el endpoint real, sin mocks: inicia sesión con el usuario de evaluación,
+confirma que las validaciones propias de `/api/analyze` (sin auth, texto vacío, texto
+demasiado largo, `source_type` inventado) siguen aplicando igual para `audio_transcript`
+—sin gastar cuota de Gemini en esos casos—, hace **una única llamada real** a Gemini con un
+caso representativo de transcripción, valida que la respuesta cumpla exactamente
+`ClassifierResult` y que `X-Check-ID` sea un UUID válido, verifica con el cliente admin
+(fuera de RLS) que la fila persistida en `checks` pertenece al usuario, tiene
+`source_type = "audio_transcript"` sin degradarse a `"text"`, y contiene el mismo `raw_text`
+y un resultado válido, confirma que ese check sería elegible para una alerta (riesgo
+alto/medio) **sin llamar a `/api/send-alert`** ni mandar ningún email, y borra la fila de
+prueba al final.
+
+```bash
+npm run eval:audio-readiness                                      # contra producción
+EVAL_BASE_URL=http://localhost:3000 npm run eval:audio-readiness  # contra vercel dev en local
+```
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

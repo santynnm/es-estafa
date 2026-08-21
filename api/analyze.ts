@@ -45,7 +45,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
   if (typeof source_type !== "string" || !(SUPPORTED_SOURCE_TYPES as readonly string[]).includes(source_type)) {
-    res.status(400).json({ error: 'source_type debe ser "text" o "image_ocr" en esta etapa.' });
+    res.status(400).json({ error: 'source_type debe ser "text", "image_ocr" o "audio_transcript".' });
     return;
   }
 
