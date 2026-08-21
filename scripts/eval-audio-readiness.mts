@@ -53,7 +53,12 @@ function section(title: string) {
   console.log(`\n${title}`);
 }
 
-function printSummary() {
+// Exportada para poder comprobar sin red, desde una corrida separada de este
+// mismo módulo, que cualquier fail() registrado (incluido uno disparado
+// dentro de runPostCheckIdVerifications) termina reflejado en
+// process.exitCode — nunca un evaluador paralelo, es la misma función que
+// usa main().
+export function printSummary() {
   console.log(`\n${failures === 0 ? "Todas las verificaciones pasaron." : `${failures} verificación(es) fallida(s).`}`);
   if (failures > 0) process.exitCode = 1;
 }
@@ -110,6 +115,127 @@ export async function cleanupCheckRow(
   }
 
   return { ok: true, detail: `fila (id: ${checkId}) eliminada y verificada ausente` };
+}
+
+interface CheckRow {
+  id: string;
+  user_id: string;
+  source_type: string;
+  raw_text: string;
+  risk_level: RiskLevel;
+  signals: unknown;
+  explanation: string;
+  recommended_action: string;
+}
+
+// Todas las comprobaciones que dependen de que exista una fila real de
+// `checks` identificada por checkId, más la limpieza de esa fila. Extraída
+// de main() para poder ejercitarla directamente, con un cliente admin
+// mockeado, en una prueba local sin red — así se reproduce el escenario
+// exacto que antes terminaba en falso positivo (fila ilegible -> fail() ->
+// return dentro de un try -> el finally limpia, pero la función termina ahí
+// y nunca llega a fijar process.exitCode) sin necesitar producción.
+//
+// Deliberadamente sin ningún `return` dentro del try: un `return` ahí
+// dispararía el `finally` (la limpieza corre igual) pero terminaría la
+// función en cuanto el `finally` completara, saltándose el printSummary()
+// que main() llama después de esperar esta función — eso es exactamente el
+// falso positivo que se corrigió acá. En cambio, cada comprobación que no
+// puede seguir sin datos previos se anida en un if/else: si falta esa base,
+// se registra el fail() correspondiente y simplemente se omiten las
+// comprobaciones que dependían de ella, sin cortar el flujo.
+export async function runPostCheckIdVerifications(
+  admin: Pick<SupabaseClient, "from">,
+  checkId: string,
+  userId: string,
+  result: ClassifierResult,
+): Promise<void> {
+  try {
+    section("Persistencia en `checks` (verificada con el cliente admin, fuera de RLS)");
+
+    const { data: row, error: rowError } = await admin
+      .from("checks")
+      .select("id, user_id, source_type, raw_text, risk_level, signals, explanation, recommended_action")
+      .eq("id", checkId)
+      .maybeSingle<CheckRow>();
+
+    if (rowError || !row) {
+      fail("la fila persistida existe y es legible", `error: ${rowError?.message ?? "(sin fila)"}`);
+    } else {
+      pass("la fila persistida existe y es legible");
+
+      if (row.user_id === userId) {
+        pass("la fila pertenece al usuario de evaluación (ownership)");
+      } else {
+        fail("la fila pertenece al usuario de evaluación (ownership)", `user_id obtenido: ${row.user_id}`);
+      }
+
+      if (row.source_type === "audio_transcript") {
+        pass('source_type persistido es exactamente "audio_transcript" (no se degradó a "text")');
+      } else {
+        fail('source_type persistido es "audio_transcript"', `obtenido: ${row.source_type}`);
+      }
+
+      if (row.raw_text === REPRESENTATIVE_RAW_TEXT) {
+        pass("raw_text persistido coincide con el enviado");
+      } else {
+        fail("raw_text persistido coincide con el enviado", `obtenido: ${row.raw_text}`);
+      }
+
+      if (
+        isClassifierResult({
+          risk_level: row.risk_level,
+          signals: row.signals,
+          explanation: row.explanation,
+          recommended_action: row.recommended_action,
+        })
+      ) {
+        pass("el resultado persistido (risk_level/signals/explanation/recommended_action) es válido");
+      } else {
+        fail("el resultado persistido es válido", `fila: ${JSON.stringify(row)}`);
+      }
+
+      section("Elegibilidad para alerta (sin llamar a /api/send-alert, cero emails)");
+
+      if (isEligibleForAlert(row.risk_level)) {
+        pass(`risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`);
+      } else {
+        fail(
+          `risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`,
+          "el caso representativo fue elegido para producir riesgo medio o alto; un resultado \"bajo\" indica una " +
+            "regresión de calibración o un caso mal elegido, no una elegibilidad confirmada",
+        );
+      }
+      console.log(
+        "  (No se llama a /api/send-alert en esta evaluación — la elegibilidad real depende también de ownership, " +
+          "contacto válido, idempotencia y cupo; ninguno de esos chequeos referencia source_type, ver api/send-alert.ts.)",
+      );
+
+      console.log(
+        `\nResultado del análisis clasificado: risk_level="${result.risk_level}", signals=${JSON.stringify(result.signals)}`,
+      );
+    }
+  } catch (err) {
+    fail(
+      "las comprobaciones posteriores al checkId terminaron sin excepciones",
+      err instanceof Error ? err.message : String(err),
+    );
+  } finally {
+    section("Limpieza");
+    try {
+      const cleanup = await cleanupCheckRow(admin, checkId);
+      if (cleanup.ok) {
+        pass(cleanup.detail);
+      } else {
+        fail("fila de prueba eliminada y verificada ausente", cleanup.detail);
+      }
+    } catch (err) {
+      fail(
+        "fila de prueba eliminada y verificada ausente",
+        `excepción durante la limpieza: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 async function main() {
@@ -219,92 +345,11 @@ async function main() {
   pass("X-Check-ID presente y con forma de UUID");
 
   // A partir de acá existe una fila de prueba real identificada por checkId.
-  // Todo lo que sigue corre en try/finally: si cualquier comprobación
-  // posterior lanza o falla, la limpieza tiene que ejecutarse igual — nunca
-  // debe quedar una fila de prueba sin intentar borrarla.
-  try {
-    section("Persistencia en `checks` (verificada con el cliente admin, fuera de RLS)");
-
-    interface CheckRow {
-      id: string;
-      user_id: string;
-      source_type: string;
-      raw_text: string;
-      risk_level: RiskLevel;
-      signals: unknown;
-      explanation: string;
-      recommended_action: string;
-    }
-
-    const { data: row, error: rowError } = await admin
-      .from("checks")
-      .select("id, user_id, source_type, raw_text, risk_level, signals, explanation, recommended_action")
-      .eq("id", checkId)
-      .maybeSingle<CheckRow>();
-
-    if (rowError || !row) {
-      fail("la fila persistida existe y es legible", `error: ${rowError?.message ?? "(sin fila)"}`);
-      return;
-    }
-    pass("la fila persistida existe y es legible");
-
-    if (row.user_id === user.id) {
-      pass("la fila pertenece al usuario de evaluación (ownership)");
-    } else {
-      fail("la fila pertenece al usuario de evaluación (ownership)", `user_id obtenido: ${row.user_id}`);
-    }
-
-    if (row.source_type === "audio_transcript") {
-      pass('source_type persistido es exactamente "audio_transcript" (no se degradó a "text")');
-    } else {
-      fail('source_type persistido es "audio_transcript"', `obtenido: ${row.source_type}`);
-    }
-
-    if (row.raw_text === REPRESENTATIVE_RAW_TEXT) {
-      pass("raw_text persistido coincide con el enviado");
-    } else {
-      fail("raw_text persistido coincide con el enviado", `obtenido: ${row.raw_text}`);
-    }
-
-    if (
-      isClassifierResult({
-        risk_level: row.risk_level,
-        signals: row.signals,
-        explanation: row.explanation,
-        recommended_action: row.recommended_action,
-      })
-    ) {
-      pass("el resultado persistido (risk_level/signals/explanation/recommended_action) es válido");
-    } else {
-      fail("el resultado persistido es válido", `fila: ${JSON.stringify(row)}`);
-    }
-
-    section("Elegibilidad para alerta (sin llamar a /api/send-alert, cero emails)");
-
-    if (isEligibleForAlert(row.risk_level)) {
-      pass(`risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`);
-    } else {
-      fail(
-        `risk_level obtenido ("${row.risk_level}") es elegible para alerta (medio/alto)`,
-        "el caso representativo fue elegido para producir riesgo medio o alto; un resultado \"bajo\" indica una " +
-          "regresión de calibración o un caso mal elegido, no una elegibilidad confirmada",
-      );
-    }
-    console.log(
-      "  (No se llama a /api/send-alert en esta evaluación — la elegibilidad real depende también de ownership, " +
-        "contacto válido, idempotencia y cupo; ninguno de esos chequeos referencia source_type, ver api/send-alert.ts.)",
-    );
-
-    console.log(`\nResultado del análisis clasificado: risk_level="${result.risk_level}", signals=${JSON.stringify(result.signals)}`);
-  } finally {
-    section("Limpieza");
-    const cleanup = await cleanupCheckRow(admin, checkId);
-    if (cleanup.ok) {
-      pass(cleanup.detail);
-    } else {
-      fail("fila de prueba eliminada y verificada ausente", cleanup.detail);
-    }
-  }
+  // runPostCheckIdVerifications hace las comprobaciones de persistencia y
+  // elegibilidad y, en su propio finally, siempre intenta la limpieza —
+  // nunca lanza (atrapa sus propias excepciones), así que awaitearla acá no
+  // puede saltearse el printSummary() de abajo bajo ningún camino.
+  await runPostCheckIdVerifications(admin, checkId, user.id, result);
 
   printSummary();
 }
