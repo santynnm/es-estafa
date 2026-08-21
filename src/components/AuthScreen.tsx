@@ -110,24 +110,30 @@ export function AuthScreen() {
             type="button"
             onClick={() => handleModeChange("login")}
             aria-pressed={mode === "login"}
-            className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition ${
+            className={`flex min-h-11 items-center justify-center gap-1.5 rounded-xl border-2 px-4 py-3 text-base font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 ${
               mode === "login"
                 ? "border-purple-600 bg-purple-600 text-white"
                 : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
             }`}
           >
+            {mode === "login" && (
+              <span aria-hidden="true">✓</span>
+            )}
             Ingresar
           </button>
           <button
             type="button"
             onClick={() => handleModeChange("signup")}
             aria-pressed={mode === "signup"}
-            className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition ${
+            className={`flex min-h-11 items-center justify-center gap-1.5 rounded-xl border-2 px-4 py-3 text-base font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 ${
               mode === "signup"
                 ? "border-purple-600 bg-purple-600 text-white"
                 : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
             }`}
           >
+            {mode === "signup" && (
+              <span aria-hidden="true">✓</span>
+            )}
             Crear cuenta
           </button>
         </div>
@@ -159,8 +165,14 @@ export function AuthScreen() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               disabled={loading}
+              aria-describedby={mode === "signup" ? "password-hint" : undefined}
               className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-4 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
             />
+            {mode === "signup" && (
+              <p id="password-hint" className="mt-1.5 text-sm text-gray-500 dark:text-gray-400">
+                Al menos {MIN_PASSWORD_LENGTH} caracteres.
+              </p>
+            )}
           </div>
 
           {mode === "signup" && (
@@ -183,7 +195,8 @@ export function AuthScreen() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
+            aria-disabled={loading}
+            className="min-h-11 w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
           >
             {loading ? "Un momento..." : mode === "login" ? "Ingresar" : "Crear cuenta"}
           </button>

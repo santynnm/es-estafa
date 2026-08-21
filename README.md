@@ -1133,6 +1133,54 @@ npm run eval:audio-readiness                                      # contra produ
 EVAL_BASE_URL=http://localhost:3000 npm run eval:audio-readiness  # contra vercel dev en local
 ```
 
+## Pulido de UX y accesibilidad (Día 8B)
+
+Pulido puramente visual/de accesibilidad sobre el frontend existente — sin funciones,
+endpoints, contratos ni arquitectura nuevos. `AuthScreen`, el encabezado de sesión,
+`Analyzer`, `ImageUpload`, `ResultCard`, `FamilyAlert` y `FamilyContacts` comparten ahora una
+identidad visual más consistente:
+
+- Objetivos táctiles de al menos 44×44px en los botones y controles principales
+  (`min-h-11` de Tailwind), texto base ≥16px en formularios (ya lo era, se mantuvo).
+- El selector texto/imagen y el toggle ingresar/crear cuenta ya no dependen solo del color
+  para mostrar cuál opción está activa: suman un ✓ visible además de `aria-pressed`.
+- `ResultCard` distingue los tres niveles de riesgo por texto + icono (✅/⚠️/🚨) + un borde
+  izquierdo más grueso en medio/alto, no solo por color — se probó con un filtro
+  `grayscale(100%)` para confirmar que siguen siendo distinguibles.
+- Separador visual marcado entre el analizador (acción principal) y "Contactos familiares"
+  (sección secundaria) en `App.tsx`; la barra de cuenta (email + "Cerrar sesión") ahora tiene
+  su propio fondo/borde para no competir visualmente con el analizador.
+- Estados `focus-visible` explícitos en botones que antes dependían solo del estilo por
+  defecto del navegador; `aria-disabled` agregado junto a `disabled` en los controles que se
+  bloquean durante una operación en curso.
+- Emails largos en `FamilyContacts` ahora envuelven (`break-all`) en vez de truncarse, para
+  no perder información ni generar overflow horizontal.
+- `FamilyAlert` agrega una nota estática (sin countdown ni reintento automático) cuando
+  `/api/send-alert` responde 429, indicando aproximadamente cuánto falta según
+  `Retry-After` — sigue siendo el usuario quien decide reintentar.
+- `prefers-reduced-motion: reduce` ahora acota a instantáneas las transiciones utilitarias
+  existentes (`src/index.css`) — no había animaciones decorativas para quitar.
+
+**Verificación visual realizada** (Playwright con todas las respuestas de Supabase Auth/REST,
+`/api/analyze`, `/api/extract-image` y `/api/send-alert` interceptadas — cero llamadas reales
+a Supabase, Gemini o Brevo durante esta verificación):
+
+- Capturas en 320×568, 375×812, 768×1024 y 1440×900, en claro y oscuro, para login, registro,
+  analizador vacío (texto/imagen), resultados bajo/medio/alto, contactos vacíos/poblados
+  (con nombre y email deliberadamente largos) y confirmación de eliminación — sin overflow
+  horizontal en ninguna combinación probada.
+- Recorrido por teclado (Tab/Enter/flechas) en login, cambio de modo texto/imagen, envío del
+  formulario de análisis y selección de contacto — todos operables sin mouse, con foco visible.
+- Confirmado: riesgo bajo no ofrece alerta; medio/alto sí; ningún contacto llega
+  preseleccionado en el selector; "Cancelar" no dispara ninguna request a `/api/send-alert`.
+- Regresiones de concurrencia de Día 7B.1 re-verificadas sin tocar esa lógica: un doble clic
+  real (`dblclick` nativo) sobre "Analizar" genera una sola request; si el texto cambia
+  mientras una request vieja sigue en vuelo, un `finally` tardío de esa request vieja no pisa
+  el resultado de la más nueva; durante un envío de alerta, "Cerrar sesión", el alta de
+  contactos y el cambio de modo quedan bloqueados; un 429 no genera countdown ni reintento
+  automático (una sola llamada real a `/api/send-alert` en 4s de espera).
+- `npm run build`, `npm run typecheck` y `npm run lint` sin errores ni warnings.
+
 ## Límite del tier gratuito de Gemini (429)
 
 El modelo usado permite 15 solicitudes por minuto en el tier gratuito. Si se supera, `/api/analyze`

@@ -239,12 +239,13 @@ export function Analyzer() {
           onClick={() => handleModeChange("text")}
           aria-pressed={mode === "text"}
           disabled={alertSending}
-          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
+          className={`flex min-h-11 items-center justify-center gap-1.5 rounded-xl border-2 px-4 py-3 text-base font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 ${
             mode === "text"
               ? "border-purple-600 bg-purple-600 text-white"
               : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
           }`}
         >
+          {mode === "text" && <span aria-hidden="true">✓</span>}
           Pegar un texto
         </button>
         <button
@@ -252,12 +253,13 @@ export function Analyzer() {
           onClick={() => handleModeChange("image")}
           aria-pressed={mode === "image"}
           disabled={alertSending}
-          className={`rounded-xl border-2 px-4 py-3 text-base font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
+          className={`flex min-h-11 items-center justify-center gap-1.5 rounded-xl border-2 px-4 py-3 text-base font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 ${
             mode === "image"
               ? "border-purple-600 bg-purple-600 text-white"
               : "border-gray-300 bg-white text-gray-700 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
           }`}
         >
+          {mode === "image" && <span aria-hidden="true">✓</span>}
           Subir una captura
         </button>
       </div>
@@ -295,7 +297,8 @@ export function Analyzer() {
         <button
           type="submit"
           disabled={!canSubmit}
-          className="mt-4 w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
+          aria-disabled={!canSubmit}
+          className="mt-4 min-h-11 w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
         >
           {submitLabel}
         </button>

@@ -34,17 +34,26 @@ function AccountBar({ email, alertSending }: { email: string; alertSending: bool
     // anterior visible al volver a ingresar.
   }
 
+  // Día 8B: barra de cuenta con su propio fondo y borde inferior, para que
+  // se lea como una franja fija por encima del contenido (email + logout)
+  // en vez de flotar sueltos sobre el mismo fondo que el analizador — así
+  // no compiten visualmente con la acción principal que viene debajo.
   return (
-    <div className="mx-auto flex max-w-2xl items-center justify-between gap-3 px-4 pt-4 text-sm text-gray-500 sm:px-6 dark:text-gray-400">
-      <span className="truncate">{email}</span>
-      <button
-        type="button"
-        onClick={handleSignOut}
-        disabled={alertSending}
-        className="shrink-0 rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
-      >
-        Cerrar sesión
-      </button>
+    <div className="border-b border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+      <div className="mx-auto flex max-w-2xl items-center justify-between gap-3 px-4 py-3 text-sm text-gray-600 sm:px-6 dark:text-gray-400">
+        <span className="min-w-0 truncate" title={email}>
+          {email}
+        </span>
+        <button
+          type="button"
+          onClick={handleSignOut}
+          disabled={alertSending}
+          aria-disabled={alertSending}
+          className="inline-flex min-h-11 shrink-0 items-center rounded-lg border border-gray-300 px-4 font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+        >
+          Cerrar sesión
+        </button>
+      </div>
     </div>
   );
 }
@@ -83,6 +92,11 @@ function App() {
         <AccountBar email={session.user.email ?? ""} alertSending={alertSending} />
         <FamilyContactsProvider>
           <Analyzer />
+          {/* Día 8B: separador visual fuerte antes de la sección secundaria
+              (gestión de contactos), para que se lea claramente distinta del
+              analizador — que sigue siendo la acción principal de la
+              pantalla. */}
+          <div className="mt-10 border-t-4 border-gray-200 dark:border-gray-800" />
           <FamilyContacts />
         </FamilyContactsProvider>
       </AlertSendingContext.Provider>

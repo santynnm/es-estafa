@@ -93,6 +93,16 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
           setOutcome({ kind: "already_sent" });
         } else if (err.status === 409) {
           setOutcome({ kind: "in_progress" });
+        } else if (err.status === 429) {
+          // Nota estática (no countdown, no reintento automático): informa
+          // cuánto suele faltar sin implicar que la app va a reintentar sola.
+          const minutes = err.retryAfterSeconds ? Math.ceil(err.retryAfterSeconds / 60) : null;
+          setOutcome({
+            kind: "error",
+            message: minutes
+              ? `${err.message} Podés volver a intentarlo en aproximadamente ${minutes} minuto${minutes === 1 ? "" : "s"}.`
+              : err.message,
+          });
         } else {
           setOutcome({ kind: "error", message: err.message });
         }
@@ -143,14 +153,14 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
           <button
             type="button"
             onClick={() => reload()}
-            className="rounded-lg border border-red-400 px-3 py-1.5 font-medium text-red-900 hover:bg-red-100 dark:border-red-600 dark:text-red-100 dark:hover:bg-red-900"
+            className="inline-flex min-h-11 items-center rounded-lg border border-red-400 px-3 font-medium text-red-900 transition hover:bg-red-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600 dark:border-red-600 dark:text-red-100 dark:hover:bg-red-900"
           >
             Reintentar
           </button>
           <button
             type="button"
             onClick={focusFamilyContacts}
-            className="rounded-lg border border-red-400 px-3 py-1.5 font-medium text-red-900 hover:bg-red-100 dark:border-red-600 dark:text-red-100 dark:hover:bg-red-900"
+            className="inline-flex min-h-11 items-center rounded-lg border border-red-400 px-3 font-medium text-red-900 transition hover:bg-red-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600 dark:border-red-600 dark:text-red-100 dark:hover:bg-red-900"
           >
             Ir a contactos
           </button>
@@ -168,7 +178,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         <button
           type="button"
           onClick={focusFamilyContacts}
-          className="mt-3 rounded-lg bg-purple-600 px-4 py-2 font-semibold text-white hover:bg-purple-700"
+          className="mt-3 inline-flex min-h-11 items-center rounded-lg bg-purple-600 px-4 font-semibold text-white transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800"
         >
           Agregar un contacto
         </button>
@@ -183,7 +193,8 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
           type="button"
           onClick={openSelector}
           disabled={alertSending}
-          className="w-full rounded-xl border-2 border-purple-600 bg-white px-6 py-4 text-lg font-bold text-purple-700 shadow-sm transition hover:bg-purple-50 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-gray-900 dark:text-purple-300 dark:hover:bg-gray-800"
+          aria-disabled={alertSending}
+          className="min-h-11 w-full rounded-xl border-2 border-purple-600 bg-white px-6 py-4 text-lg font-bold text-purple-700 shadow-sm transition hover:bg-purple-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-gray-900 dark:text-purple-300 dark:hover:bg-gray-800"
         >
           Avisarle a un familiar
         </button>
@@ -201,7 +212,7 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
         value={selectedContactId ?? ""}
         disabled={alertSending}
         onChange={(e) => setSelectedContactId(e.target.value || null)}
-        className="mt-2 w-full rounded-xl border-2 border-gray-300 bg-white p-3 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
+        className="mt-2 min-h-11 w-full rounded-xl border-2 border-gray-300 bg-white p-3 text-base text-gray-900 shadow-sm focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100"
       >
         <option value="" disabled>
           Seleccioná un contacto...
@@ -238,7 +249,8 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
               type="button"
               onClick={confirmSend}
               disabled={alertSending}
-              className="rounded-xl bg-purple-600 px-5 py-3 text-base font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
+              aria-disabled={alertSending}
+              className="min-h-11 rounded-xl bg-purple-600 px-5 py-3 text-base font-bold text-white shadow-md transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
             >
               {alertSending ? "Enviando alerta..." : "Confirmar envío"}
             </button>
@@ -246,7 +258,8 @@ export function FamilyAlert({ checkId, riskLevel }: { checkId: string; riskLevel
               type="button"
               onClick={cancel}
               disabled={alertSending}
-              className="rounded-xl border border-gray-300 px-5 py-3 text-base font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+              aria-disabled={alertSending}
+              className="min-h-11 rounded-xl border border-gray-300 px-5 py-3 text-base font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
             >
               Cancelar
             </button>

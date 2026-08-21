@@ -124,16 +124,20 @@ export function FamilyContacts() {
             >
               <div className="min-w-0">
                 <p className="break-words font-semibold">{c.nombre}</p>
-                <p className="truncate text-sm text-gray-600 dark:text-gray-400">{c.email}</p>
+                <p className="break-all text-sm text-gray-600 dark:text-gray-400">{c.email}</p>
               </div>
 
               {confirmDeleteId === c.id ? (
-                <div className="flex shrink-0 gap-2">
+                <div className="flex shrink-0 flex-wrap gap-2">
+                  <span role="status" className="sr-only">
+                    Confirmá si querés eliminar a {c.nombre}.
+                  </span>
                   <button
                     type="button"
                     onClick={() => handleDelete(c.id)}
                     disabled={deletingId === c.id || alertSending}
-                    className="rounded-lg bg-red-600 px-3 py-1.5 font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    aria-disabled={deletingId === c.id || alertSending}
+                    className="inline-flex min-h-11 items-center rounded-lg bg-red-600 px-3 font-medium text-white transition hover:bg-red-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-800 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {deletingId === c.id ? "Eliminando..." : "Sí, eliminar"}
                   </button>
@@ -141,7 +145,8 @@ export function FamilyContacts() {
                     type="button"
                     onClick={() => setConfirmDeleteId(null)}
                     disabled={deletingId === c.id || alertSending}
-                    className="rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                    aria-disabled={deletingId === c.id || alertSending}
+                    className="inline-flex min-h-11 items-center rounded-lg border border-gray-300 px-3 font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
                   >
                     Cancelar
                   </button>
@@ -151,7 +156,8 @@ export function FamilyContacts() {
                   type="button"
                   onClick={() => setConfirmDeleteId(c.id)}
                   disabled={alertSending}
-                  className="shrink-0 rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                  aria-disabled={alertSending}
+                  className="inline-flex min-h-11 shrink-0 items-center rounded-lg border border-gray-300 px-3 font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
                 >
                   Eliminar
                 </button>
@@ -204,7 +210,8 @@ export function FamilyContacts() {
         <button
           type="submit"
           disabled={addLoading || alertSending}
-          className="w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
+          aria-disabled={addLoading || alertSending}
+          className="min-h-11 w-full rounded-xl bg-purple-600 px-6 py-4 text-xl font-bold text-white shadow-md transition hover:bg-purple-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-800 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 dark:disabled:bg-gray-800 dark:disabled:text-gray-500"
         >
           {addLoading ? "Agregando..." : "Agregar contacto"}
         </button>

@@ -74,15 +74,17 @@ export function ImageUpload({ file, onFileChange, error, onErrorChange, disabled
       </label>
 
       {!file && (
-        <label
-          htmlFor="image-upload"
-          className="mt-2 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-300 bg-white p-8 text-center text-base text-gray-600 hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-400"
-        >
-          <span className="text-3xl" aria-hidden="true">
-            📷
-          </span>
-          <span>Tocá para elegir una imagen (PNG, JPEG o WebP, máx. 3 MB)</span>
-        </label>
+        <div className="mt-2 rounded-xl focus-within:ring-2 focus-within:ring-purple-400">
+          <label
+            htmlFor="image-upload"
+            className="flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-300 bg-white p-8 text-center text-base text-gray-600 transition hover:border-purple-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-400"
+          >
+            <span className="text-3xl" aria-hidden="true">
+              📷
+            </span>
+            <span>Tocá para elegir una imagen (PNG, JPEG o WebP, máx. 3 MB)</span>
+          </label>
+        </div>
       )}
 
       <input
@@ -113,7 +115,7 @@ export function ImageUpload({ file, onFileChange, error, onErrorChange, disabled
                 type="button"
                 onClick={() => inputRef.current?.click()}
                 disabled={disabled}
-                className="rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                className="inline-flex min-h-11 items-center rounded-lg border border-gray-300 px-3 font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
               >
                 Cambiar
               </button>
@@ -121,7 +123,7 @@ export function ImageUpload({ file, onFileChange, error, onErrorChange, disabled
                 type="button"
                 onClick={handleRemove}
                 disabled={disabled}
-                className="rounded-lg border border-gray-300 px-3 py-1.5 font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+                className="inline-flex min-h-11 items-center rounded-lg border border-gray-300 px-3 font-medium text-gray-700 transition hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-purple-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
               >
                 Quitar
               </button>

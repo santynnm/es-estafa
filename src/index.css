@@ -7,3 +7,19 @@
 body {
   margin: 0;
 }
+
+/* Día 8B: si el usuario pidió menos movimiento en su sistema, las
+   transiciones de color/estado (hover, focus, disabled) de toda la app se
+   vuelven instantáneas en vez de animadas. No hay animaciones decorativas
+   en este proyecto — esto solo acota las transiciones utilitarias que ya
+   existían (Tailwind `transition`). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
